@@ -1,4 +1,4 @@
-﻿# Cache Policy Simulator (C++)
+# Cache Policy Simulator (C++)
 
 Command-line cache simulator for comparing FIFO vs LRU hit behavior on real access traces.
 
@@ -33,3 +33,9 @@ Arguments:
 ## Example workload
 
 `sample_trace.txt` includes mixed locality to show where LRU usually outperforms FIFO.
+
+## Portfolio Positioning
+
+- Project type: C++ command-line utility
+- Verification path: g++ -std=c++17 -O2 -Wall -Wextra -pedantic cache_policy_sim.cpp -o cache_policy_sim && ./cache_policy_sim sample_trace.txt 4
+
