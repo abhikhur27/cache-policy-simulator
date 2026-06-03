@@ -27,6 +27,10 @@ Arguments:
 
 - Hits / misses for FIFO and LRU
 - Hit-rate percentage for each policy
+- Trace profile summary:
+  - unique-key count
+  - reuse rate
+  - hottest key frequency
 - Final cache contents
 - Winner summary showing hit-count delta
 

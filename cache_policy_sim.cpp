@@ -18,6 +18,13 @@ struct Result {
   std::vector<int> finalCache;
 };
 
+struct TraceStats {
+  int uniqueKeys = 0;
+  int repeatedAccesses = 0;
+  int hottestKey = 0;
+  int hottestKeyCount = 0;
+};
+
 std::vector<int> parseTrace(std::istream& input) {
   std::vector<int> trace;
   std::string line;
@@ -69,6 +76,25 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy)
   return result;
 }
 
+TraceStats analyzeTrace(const std::vector<int>& trace) {
+  TraceStats stats;
+  std::unordered_map<int, int> frequencies;
+
+  for (int key : trace) {
+    const int nextCount = ++frequencies[key];
+    if (nextCount > 1) {
+      stats.repeatedAccesses += 1;
+    }
+    if (nextCount > stats.hottestKeyCount) {
+      stats.hottestKey = key;
+      stats.hottestKeyCount = nextCount;
+    }
+  }
+
+  stats.uniqueKeys = static_cast<int>(frequencies.size());
+  return stats;
+}
+
 void printResult(const std::string& label, const Result& result, int totalAccesses) {
   const double hitRate = totalAccesses > 0 ? static_cast<double>(result.hits) / totalAccesses : 0.0;
   std::cout << label << "\n";
@@ -116,9 +142,16 @@ int main(int argc, char* argv[]) {
 
   const Result fifo = runSimulation(trace, capacity, Policy::FIFO);
   const Result lru = runSimulation(trace, capacity, Policy::LRU);
+  const TraceStats stats = analyzeTrace(trace);
+  const double reuseRate =
+      trace.empty() ? 0.0 : static_cast<double>(stats.repeatedAccesses) / static_cast<double>(trace.size());
 
   std::cout << "Cache Policy Simulator\n";
   std::cout << "Accesses: " << trace.size() << " | Capacity: " << capacity << "\n\n";
+  std::cout << "Trace profile\n";
+  std::cout << "  Unique keys: " << stats.uniqueKeys << "\n";
+  std::cout << "  Reuse rate: " << std::fixed << std::setprecision(2) << (reuseRate * 100.0) << "%\n";
+  std::cout << "  Hottest key: " << stats.hottestKey << " (" << stats.hottestKeyCount << " accesses)\n\n";
 
   printResult("FIFO", fifo, static_cast<int>(trace.size()));
   std::cout << "\n";
