@@ -26,6 +26,8 @@ Arguments:
 ## Output
 
 - Hits / misses for FIFO and LRU
+- Cold vs reload miss breakdown
+- Eviction count under each policy
 - Hit-rate percentage for each policy
 - Trace profile summary:
   - unique-key count

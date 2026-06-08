@@ -5,6 +5,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 enum class Policy {
@@ -15,6 +16,9 @@ enum class Policy {
 struct Result {
   int hits = 0;
   int misses = 0;
+  int coldMisses = 0;
+  int reloadMisses = 0;
+  int evictions = 0;
   std::vector<int> finalCache;
 };
 
@@ -46,6 +50,7 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy)
   std::vector<int> cache;
   cache.reserve(static_cast<size_t>(capacity));
   std::unordered_map<int, int> positions;
+  std::unordered_set<int> seenKeys;
 
   for (int key : trace) {
     auto found = positions.find(key);
@@ -64,9 +69,15 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy)
     }
 
     result.misses += 1;
+    if (seenKeys.insert(key).second) {
+      result.coldMisses += 1;
+    } else {
+      result.reloadMisses += 1;
+    }
     if (static_cast<int>(cache.size()) >= capacity) {
       positions.erase(cache.front());
       cache.erase(cache.begin());
+      result.evictions += 1;
     }
     cache.push_back(key);
     positions[key] = static_cast<int>(cache.size() - 1);
@@ -100,6 +111,9 @@ void printResult(const std::string& label, const Result& result, int totalAccess
   std::cout << label << "\n";
   std::cout << "  Hits: " << result.hits << "\n";
   std::cout << "  Misses: " << result.misses << "\n";
+  std::cout << "  Cold misses: " << result.coldMisses << "\n";
+  std::cout << "  Reload misses: " << result.reloadMisses << "\n";
+  std::cout << "  Evictions: " << result.evictions << "\n";
   std::cout << "  Hit rate: " << std::fixed << std::setprecision(2) << (hitRate * 100.0) << "%\n";
   std::cout << "  Final cache: [";
   for (size_t i = 0; i < result.finalCache.size(); ++i) {
