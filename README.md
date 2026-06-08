@@ -40,6 +40,15 @@ Arguments:
 
 `sample_trace.txt` includes mixed locality to show where LRU usually outperforms FIFO.
 
+## Example verification
+
+```bash
+g++ -std=c++17 -O2 -Wall -Wextra -pedantic cache_policy_sim.cpp -o cache_policy_sim
+./cache_policy_sim sample_trace.txt 4
+```
+
+That run should print the trace profile first, then separate FIFO/LRU result blocks and a final winner summary.
+
 ## Portfolio Positioning
 
 - Project type: C++ command-line utility
