@@ -49,6 +49,14 @@ g++ -std=c++17 -O2 -Wall -Wextra -pedantic cache_policy_sim.cpp -o cache_policy_
 
 That run should print the trace profile first, then separate FIFO/LRU result blocks and a final winner summary.
 
+## Portfolio Demo Script
+
+Use the same trace with at least two cache sizes when explaining the result:
+
+1. Capacity 2 or 3 to show early eviction pressure.
+2. Capacity 4 to show whether LRU actually converts locality into hit-rate lift.
+3. Call out the winner summary only after reading the reuse profile so the claim stays tied to workload shape.
+
 ## Portfolio Positioning
 
 - Project type: C++ command-line utility
