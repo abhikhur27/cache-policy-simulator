@@ -18,10 +18,17 @@ g++ -std=c++17 -O2 -Wall -Wextra -pedantic cache_policy_sim.cpp -o cache_policy_
 ./cache_policy_sim sample_trace.txt 4
 ```
 
+Sweep multiple capacities in one pass:
+
+```bash
+./cache_policy_sim sample_trace.txt 2-6
+./cache_policy_sim sample_trace.txt 2,4,8
+```
+
 Arguments:
 
 - `trace_file`: Text file with integer keys (space or comma separated)
-- `cache_capacity`: Positive integer cache size
+- `cache_capacity`: Positive integer cache size, ascending range, or comma-separated list
 
 ## Output
 
@@ -35,6 +42,7 @@ Arguments:
   - hottest key frequency
 - Final cache contents
 - Winner summary showing hit-count delta
+- Capacity-sweep table showing where FIFO/LRU diverge as cache size grows
 
 ## Example workload
 
