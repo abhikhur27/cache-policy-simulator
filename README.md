@@ -43,6 +43,7 @@ Arguments:
 - Final cache contents
 - Winner summary showing hit-count delta
 - Capacity-sweep table showing where FIFO/LRU diverge as cache size grows
+- Belady anomaly check that flags when FIFO gets worse after adding capacity
 
 ## Example workload
 

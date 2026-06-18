@@ -185,6 +185,44 @@ void printSweepSummary(const std::vector<int>& capacities, const std::vector<Res
   }
 }
 
+void printBeladyAlerts(const std::vector<int>& capacities, const std::vector<Result>& fifoResults,
+                       const std::vector<Result>& lruResults) {
+  std::vector<std::string> fifoAlerts;
+  std::vector<std::string> lruNotes;
+
+  for (size_t i = 1; i < capacities.size(); ++i) {
+    if (fifoResults[i].misses > fifoResults[i - 1].misses) {
+      std::ostringstream row;
+      row << "  FIFO anomaly between capacity " << capacities[i - 1] << " and " << capacities[i]
+          << ": misses rose from " << fifoResults[i - 1].misses << " to " << fifoResults[i].misses << ".";
+      fifoAlerts.push_back(row.str());
+    }
+    if (lruResults[i].misses > lruResults[i - 1].misses) {
+      std::ostringstream row;
+      row << "  LRU misses rose from " << lruResults[i - 1].misses << " to " << lruResults[i].misses
+          << " between capacity " << capacities[i - 1] << " and " << capacities[i]
+          << ". Re-check the trace because LRU should not show Belady anomalies.";
+      lruNotes.push_back(row.str());
+    }
+  }
+
+  std::cout << "\nBelady anomaly check\n";
+  if (fifoAlerts.empty()) {
+    std::cout << "  FIFO showed no Belady anomaly across the requested capacities.\n";
+  } else {
+    std::cout << "  FIFO anomaly detected:\n";
+    for (const std::string& alert : fifoAlerts) {
+      std::cout << alert << "\n";
+    }
+  }
+
+  if (!lruNotes.empty()) {
+    for (const std::string& note : lruNotes) {
+      std::cout << note << "\n";
+    }
+  }
+}
+
 int main(int argc, char* argv[]) {
   if (argc < 3) {
     std::cerr << "Usage: cache_policy_sim <trace_file> <cache_capacity|start-end|c1,c2,...>\n";
@@ -254,6 +292,7 @@ int main(int argc, char* argv[]) {
   }
 
   printSweepSummary(capacities, fifoResults, lruResults, static_cast<int>(trace.size()));
+  printBeladyAlerts(capacities, fifoResults, lruResults);
 
   return 0;
 }
