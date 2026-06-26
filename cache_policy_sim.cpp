@@ -30,6 +30,12 @@ struct TraceStats {
   int hottestKeyCount = 0;
 };
 
+struct CommandLineOptions {
+  std::string traceFile;
+  std::vector<int> capacities;
+  std::string csvOutPath;
+};
+
 std::vector<int> parseCapacities(const std::string& raw) {
   std::vector<int> capacities;
   if (raw.find('-') != std::string::npos) {
@@ -223,23 +229,71 @@ void printBeladyAlerts(const std::vector<int>& capacities, const std::vector<Res
   }
 }
 
-int main(int argc, char* argv[]) {
+CommandLineOptions parseOptions(int argc, char* argv[]) {
   if (argc < 3) {
-    std::cerr << "Usage: cache_policy_sim <trace_file> <cache_capacity|start-end|c1,c2,...>\n";
-    return 1;
+    throw std::invalid_argument("Usage");
   }
 
-  std::ifstream file(argv[1]);
-  if (!file.is_open()) {
-    std::cerr << "Could not open trace file: " << argv[1] << "\n";
-    return 1;
+  CommandLineOptions options;
+  options.traceFile = argv[1];
+  options.capacities = parseCapacities(argv[2]);
+
+  for (int index = 3; index < argc; ++index) {
+    const std::string arg = argv[index];
+    if (arg == "--csv-out") {
+      if (index + 1 >= argc) {
+        throw std::invalid_argument("Missing CSV output path after --csv-out.");
+      }
+      options.csvOutPath = argv[++index];
+      continue;
+    }
+    throw std::invalid_argument("Unknown argument: " + arg);
   }
 
-  std::vector<int> capacities;
+  return options;
+}
+
+void writeCsvReport(const std::string& path, const std::vector<int>& capacities, const std::vector<Result>& fifoResults,
+                    const std::vector<Result>& lruResults, const TraceStats& stats, int totalAccesses) {
+  std::ofstream out(path);
+  if (!out.is_open()) {
+    throw std::runtime_error("Could not open CSV output path: " + path);
+  }
+
+  const double reuseRate =
+      totalAccesses > 0 ? static_cast<double>(stats.repeatedAccesses) / static_cast<double>(totalAccesses) : 0.0;
+
+  out << "capacity,policy,hits,misses,cold_misses,reload_misses,evictions,hit_rate,unique_keys,reuse_rate,hottest_key,"
+         "hottest_key_count\n";
+
+  const auto writeRow = [&](int capacity, const char* policy, const Result& result) {
+    const double hitRate = totalAccesses > 0 ? static_cast<double>(result.hits) / static_cast<double>(totalAccesses) : 0.0;
+    out << capacity << ',' << policy << ',' << result.hits << ',' << result.misses << ',' << result.coldMisses << ','
+        << result.reloadMisses << ',' << result.evictions << ',' << std::fixed << std::setprecision(4) << hitRate << ','
+        << stats.uniqueKeys << ',' << reuseRate << ',' << stats.hottestKey << ',' << stats.hottestKeyCount << "\n";
+  };
+
+  for (size_t i = 0; i < capacities.size(); ++i) {
+    writeRow(capacities[i], "FIFO", fifoResults[i]);
+    writeRow(capacities[i], "LRU", lruResults[i]);
+  }
+}
+
+int main(int argc, char* argv[]) {
+  CommandLineOptions options;
   try {
-    capacities = parseCapacities(argv[2]);
-  } catch (...) {
-    std::cerr << "Cache capacity must be a positive integer, ascending range, or comma-separated list.\n";
+    options = parseOptions(argc, argv);
+  } catch (const std::exception& error) {
+    std::cerr << "Usage: cache_policy_sim <trace_file> <cache_capacity|start-end|c1,c2,...> [--csv-out report.csv]\n";
+    if (std::string(error.what()) != "Usage") {
+      std::cerr << error.what() << "\n";
+    }
+    return 1;
+  }
+
+  std::ifstream file(options.traceFile);
+  if (!file.is_open()) {
+    std::cerr << "Could not open trace file: " << options.traceFile << "\n";
     return 1;
   }
 
@@ -255,9 +309,9 @@ int main(int argc, char* argv[]) {
 
   std::cout << "Cache Policy Simulator\n";
   std::cout << "Accesses: " << trace.size() << " | Capacities: ";
-  for (size_t i = 0; i < capacities.size(); ++i) {
+  for (size_t i = 0; i < options.capacities.size(); ++i) {
     if (i) std::cout << ", ";
-    std::cout << capacities[i];
+    std::cout << options.capacities[i];
   }
   std::cout << "\n\n";
   std::cout << "Trace profile\n";
@@ -267,15 +321,25 @@ int main(int argc, char* argv[]) {
 
   std::vector<Result> fifoResults;
   std::vector<Result> lruResults;
-  fifoResults.reserve(capacities.size());
-  lruResults.reserve(capacities.size());
+  fifoResults.reserve(options.capacities.size());
+  lruResults.reserve(options.capacities.size());
 
-  for (int capacity : capacities) {
+  for (int capacity : options.capacities) {
     fifoResults.push_back(runSimulation(trace, capacity, Policy::FIFO));
     lruResults.push_back(runSimulation(trace, capacity, Policy::LRU));
   }
 
-  if (capacities.size() == 1) {
+  if (!options.csvOutPath.empty()) {
+    try {
+      writeCsvReport(options.csvOutPath, options.capacities, fifoResults, lruResults, stats, static_cast<int>(trace.size()));
+      std::cout << "CSV report: " << options.csvOutPath << "\n\n";
+    } catch (const std::exception& error) {
+      std::cerr << error.what() << "\n";
+      return 1;
+    }
+  }
+
+  if (options.capacities.size() == 1) {
     printResult("FIFO", fifoResults[0], static_cast<int>(trace.size()));
     std::cout << "\n";
     printResult("LRU", lruResults[0], static_cast<int>(trace.size()));
@@ -291,8 +355,8 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
-  printSweepSummary(capacities, fifoResults, lruResults, static_cast<int>(trace.size()));
-  printBeladyAlerts(capacities, fifoResults, lruResults);
+  printSweepSummary(options.capacities, fifoResults, lruResults, static_cast<int>(trace.size()));
+  printBeladyAlerts(options.capacities, fifoResults, lruResults);
 
   return 0;
 }

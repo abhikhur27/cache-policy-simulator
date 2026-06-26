@@ -25,6 +25,12 @@ Sweep multiple capacities in one pass:
 ./cache_policy_sim sample_trace.txt 2,4,8
 ```
 
+Write the comparison table to CSV for lab notes or spreadsheet review:
+
+```bash
+./cache_policy_sim sample_trace.txt 2-6 --csv-out reports/cache-sweep.csv
+```
+
 Arguments:
 
 - `trace_file`: Text file with integer keys (space or comma separated)
@@ -44,6 +50,7 @@ Arguments:
 - Winner summary showing hit-count delta
 - Capacity-sweep table showing where FIFO/LRU diverge as cache size grows
 - Belady anomaly check that flags when FIFO gets worse after adding capacity
+- Optional CSV export with one row per policy/capacity pair
 
 ## Example workload
 
