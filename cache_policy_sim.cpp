@@ -1,7 +1,9 @@
 ﻿#include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -12,6 +14,7 @@
 enum class Policy {
   FIFO,
   LRU,
+  OPT,
 };
 
 struct Result {
@@ -95,6 +98,64 @@ std::vector<int> parseTrace(std::istream& input) {
 }
 
 Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy) {
+  if (policy == Policy::OPT) {
+    Result result;
+    if (capacity <= 0) return result;
+
+    std::unordered_map<int, std::vector<int>> futureAccesses;
+    for (int index = 0; index < static_cast<int>(trace.size()); ++index) {
+      futureAccesses[trace[static_cast<size_t>(index)]].push_back(index);
+    }
+
+    std::vector<int> cache;
+    cache.reserve(static_cast<size_t>(capacity));
+    std::unordered_set<int> cacheSet;
+    std::unordered_set<int> seenKeys;
+
+    for (int index = 0; index < static_cast<int>(trace.size()); ++index) {
+      const int key = trace[static_cast<size_t>(index)];
+      std::vector<int>& offsets = futureAccesses[key];
+      if (!offsets.empty() && offsets.front() == index) {
+        offsets.erase(offsets.begin());
+      }
+
+      if (cacheSet.find(key) != cacheSet.end()) {
+        result.hits += 1;
+        continue;
+      }
+
+      result.misses += 1;
+      if (seenKeys.insert(key).second) {
+        result.coldMisses += 1;
+      } else {
+        result.reloadMisses += 1;
+      }
+
+      if (static_cast<int>(cache.size()) >= capacity) {
+        size_t victimIndex = 0;
+        int farthestUse = -1;
+        for (size_t cacheIndex = 0; cacheIndex < cache.size(); ++cacheIndex) {
+          const int cachedKey = cache[cacheIndex];
+          const auto& nextUses = futureAccesses[cachedKey];
+          const int nextUse = nextUses.empty() ? std::numeric_limits<int>::max() : nextUses.front();
+          if (nextUse > farthestUse) {
+            farthestUse = nextUse;
+            victimIndex = cacheIndex;
+          }
+        }
+        cacheSet.erase(cache[victimIndex]);
+        cache.erase(cache.begin() + static_cast<std::ptrdiff_t>(victimIndex));
+        result.evictions += 1;
+      }
+
+      cache.push_back(key);
+      cacheSet.insert(key);
+    }
+
+    result.finalCache = cache;
+    return result;
+  }
+
   Result result;
   if (capacity <= 0) return result;
 
@@ -175,19 +236,25 @@ void printResult(const std::string& label, const Result& result, int totalAccess
 }
 
 void printSweepSummary(const std::vector<int>& capacities, const std::vector<Result>& fifoResults,
-                       const std::vector<Result>& lruResults, int totalAccesses) {
+                       const std::vector<Result>& lruResults, const std::vector<Result>& optResults,
+                       int totalAccesses) {
   std::cout << "Capacity sweep\n";
-  std::cout << "Cap | FIFO hit% | LRU hit% | Delta hits | Winner\n";
+  std::cout << "Cap | FIFO hit% | LRU hit% | OPT hit% | Winner | LRU regret | FIFO regret\n";
   for (size_t i = 0; i < capacities.size(); ++i) {
     const double fifoRate =
         totalAccesses > 0 ? static_cast<double>(fifoResults[i].hits) / static_cast<double>(totalAccesses) : 0.0;
     const double lruRate =
         totalAccesses > 0 ? static_cast<double>(lruResults[i].hits) / static_cast<double>(totalAccesses) : 0.0;
-    const int hitDelta = lruResults[i].hits - fifoResults[i].hits;
-    const std::string winner = hitDelta > 0 ? "LRU" : (hitDelta < 0 ? "FIFO" : "Tie");
+    const double optRate =
+        totalAccesses > 0 ? static_cast<double>(optResults[i].hits) / static_cast<double>(totalAccesses) : 0.0;
+    const int bestHits = std::max({fifoResults[i].hits, lruResults[i].hits, optResults[i].hits});
+    const std::string winner = bestHits == optResults[i].hits ? "OPT" : (bestHits == lruResults[i].hits ? "LRU" : "FIFO");
+    const int lruRegret = optResults[i].hits - lruResults[i].hits;
+    const int fifoRegret = optResults[i].hits - fifoResults[i].hits;
     std::cout << std::setw(3) << capacities[i] << " | " << std::setw(8) << std::fixed << std::setprecision(2)
-              << (fifoRate * 100.0) << "% | " << std::setw(7) << (lruRate * 100.0) << "% | " << std::setw(10)
-              << hitDelta << " | " << winner << "\n";
+              << (fifoRate * 100.0) << "% | " << std::setw(7) << (lruRate * 100.0) << "% | " << std::setw(7)
+              << (optRate * 100.0) << "% | " << std::setw(6) << winner << " | " << std::setw(10) << lruRegret
+              << " | " << std::setw(11) << fifoRegret << "\n";
   }
 }
 
@@ -254,8 +321,13 @@ CommandLineOptions parseOptions(int argc, char* argv[]) {
 }
 
 void writeCsvReport(const std::string& path, const std::vector<int>& capacities, const std::vector<Result>& fifoResults,
-                    const std::vector<Result>& lruResults, const TraceStats& stats, int totalAccesses) {
-  std::ofstream out(path);
+                    const std::vector<Result>& lruResults, const std::vector<Result>& optResults,
+                    const TraceStats& stats, int totalAccesses) {
+  const std::filesystem::path outputPath(path);
+  if (!outputPath.parent_path().empty()) {
+    std::filesystem::create_directories(outputPath.parent_path());
+  }
+  std::ofstream out(outputPath);
   if (!out.is_open()) {
     throw std::runtime_error("Could not open CSV output path: " + path);
   }
@@ -276,6 +348,7 @@ void writeCsvReport(const std::string& path, const std::vector<int>& capacities,
   for (size_t i = 0; i < capacities.size(); ++i) {
     writeRow(capacities[i], "FIFO", fifoResults[i]);
     writeRow(capacities[i], "LRU", lruResults[i]);
+    writeRow(capacities[i], "OPT", optResults[i]);
   }
 }
 
@@ -321,17 +394,21 @@ int main(int argc, char* argv[]) {
 
   std::vector<Result> fifoResults;
   std::vector<Result> lruResults;
+  std::vector<Result> optResults;
   fifoResults.reserve(options.capacities.size());
   lruResults.reserve(options.capacities.size());
+  optResults.reserve(options.capacities.size());
 
   for (int capacity : options.capacities) {
     fifoResults.push_back(runSimulation(trace, capacity, Policy::FIFO));
     lruResults.push_back(runSimulation(trace, capacity, Policy::LRU));
+    optResults.push_back(runSimulation(trace, capacity, Policy::OPT));
   }
 
   if (!options.csvOutPath.empty()) {
     try {
-      writeCsvReport(options.csvOutPath, options.capacities, fifoResults, lruResults, stats, static_cast<int>(trace.size()));
+      writeCsvReport(options.csvOutPath, options.capacities, fifoResults, lruResults, optResults, stats,
+                     static_cast<int>(trace.size()));
       std::cout << "CSV report: " << options.csvOutPath << "\n\n";
     } catch (const std::exception& error) {
       std::cerr << error.what() << "\n";
@@ -343,8 +420,12 @@ int main(int argc, char* argv[]) {
     printResult("FIFO", fifoResults[0], static_cast<int>(trace.size()));
     std::cout << "\n";
     printResult("LRU", lruResults[0], static_cast<int>(trace.size()));
+    std::cout << "\n";
+    printResult("OPT", optResults[0], static_cast<int>(trace.size()));
 
     const int hitDelta = lruResults[0].hits - fifoResults[0].hits;
+    const int lruRegret = optResults[0].hits - lruResults[0].hits;
+    const int fifoRegret = optResults[0].hits - fifoResults[0].hits;
     if (hitDelta > 0) {
       std::cout << "\nLRU gained " << hitDelta << " extra hits on this workload.\n";
     } else if (hitDelta < 0) {
@@ -352,10 +433,12 @@ int main(int argc, char* argv[]) {
     } else {
       std::cout << "\nBoth policies produced the same hit count on this workload.\n";
     }
+    std::cout << "LRU regret vs OPT: " << lruRegret << " hit(s)\n";
+    std::cout << "FIFO regret vs OPT: " << fifoRegret << " hit(s)\n";
     return 0;
   }
 
-  printSweepSummary(options.capacities, fifoResults, lruResults, static_cast<int>(trace.size()));
+  printSweepSummary(options.capacities, fifoResults, lruResults, optResults, static_cast<int>(trace.size()));
   printBeladyAlerts(options.capacities, fifoResults, lruResults);
 
   return 0;

@@ -1,6 +1,6 @@
 # Cache Policy Simulator (C++)
 
-Command-line cache simulator for comparing FIFO vs LRU hit behavior on real access traces.
+Command-line cache simulator for comparing FIFO, LRU, and an optimal offline baseline on real access traces.
 
 ## Why this exists
 
@@ -38,7 +38,7 @@ Arguments:
 
 ## Output
 
-- Hits / misses for FIFO and LRU
+- Hits / misses for FIFO, LRU, and OPT
 - Cold vs reload miss breakdown
 - Eviction count under each policy
 - Hit-rate percentage for each policy
@@ -47,7 +47,7 @@ Arguments:
   - reuse rate
   - hottest key frequency
 - Final cache contents
-- Winner summary showing hit-count delta
+- Winner summary showing hit-count delta plus regret versus OPT
 - Capacity-sweep table showing where FIFO/LRU diverge as cache size grows
 - Belady anomaly check that flags when FIFO gets worse after adding capacity
 - Optional CSV export with one row per policy/capacity pair
@@ -63,7 +63,7 @@ g++ -std=c++17 -O2 -Wall -Wextra -pedantic cache_policy_sim.cpp -o cache_policy_
 ./cache_policy_sim sample_trace.txt 4
 ```
 
-That run should print the trace profile first, then separate FIFO/LRU result blocks and a final winner summary.
+That run should print the trace profile first, then separate FIFO/LRU/OPT result blocks and a final regret summary.
 
 ## Portfolio Demo Script
 
