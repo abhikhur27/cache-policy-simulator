@@ -37,6 +37,7 @@ struct CommandLineOptions {
   std::string traceFile;
   std::vector<int> capacities;
   std::string csvOutPath;
+  std::string markdownOutPath;
 };
 
 std::vector<int> parseCapacities(const std::string& raw) {
@@ -296,6 +297,15 @@ void printBeladyAlerts(const std::vector<int>& capacities, const std::vector<Res
   }
 }
 
+double hitRate(const Result& result, int totalAccesses) {
+  return totalAccesses > 0 ? static_cast<double>(result.hits) / static_cast<double>(totalAccesses) : 0.0;
+}
+
+const char* winnerLabel(const Result& fifoResult, const Result& lruResult, const Result& optResult) {
+  const int bestHits = std::max({fifoResult.hits, lruResult.hits, optResult.hits});
+  return bestHits == optResult.hits ? "OPT" : (bestHits == lruResult.hits ? "LRU" : "FIFO");
+}
+
 CommandLineOptions parseOptions(int argc, char* argv[]) {
   if (argc < 3) {
     throw std::invalid_argument("Usage");
@@ -312,6 +322,13 @@ CommandLineOptions parseOptions(int argc, char* argv[]) {
         throw std::invalid_argument("Missing CSV output path after --csv-out.");
       }
       options.csvOutPath = argv[++index];
+      continue;
+    }
+    if (arg == "--markdown-out") {
+      if (index + 1 >= argc) {
+        throw std::invalid_argument("Missing Markdown output path after --markdown-out.");
+      }
+      options.markdownOutPath = argv[++index];
       continue;
     }
     throw std::invalid_argument("Unknown argument: " + arg);
@@ -352,12 +369,71 @@ void writeCsvReport(const std::string& path, const std::vector<int>& capacities,
   }
 }
 
+void writeMarkdownReport(const std::string& path, const std::vector<int>& capacities,
+                         const std::vector<Result>& fifoResults, const std::vector<Result>& lruResults,
+                         const std::vector<Result>& optResults, const TraceStats& stats, int totalAccesses) {
+  const std::filesystem::path outputPath(path);
+  if (!outputPath.parent_path().empty()) {
+    std::filesystem::create_directories(outputPath.parent_path());
+  }
+
+  std::ofstream out(outputPath);
+  if (!out.is_open()) {
+    throw std::runtime_error("Could not open Markdown output path: " + path);
+  }
+
+  const double reuseRate =
+      totalAccesses > 0 ? static_cast<double>(stats.repeatedAccesses) / static_cast<double>(totalAccesses) : 0.0;
+
+  out << "# Cache Policy Brief\n\n";
+  out << "- Accesses: `" << totalAccesses << "`\n";
+  out << "- Unique keys: `" << stats.uniqueKeys << "`\n";
+  out << "- Reuse rate: `" << std::fixed << std::setprecision(2) << (reuseRate * 100.0) << "%`\n";
+  out << "- Hottest key: `" << stats.hottestKey << "` with `" << stats.hottestKeyCount << "` accesses\n\n";
+
+  out << "## Capacity sweep\n\n";
+  out << "| Capacity | FIFO hit % | LRU hit % | OPT hit % | Winner | LRU regret | FIFO regret |\n";
+  out << "| --- | ---: | ---: | ---: | --- | ---: | ---: |\n";
+  for (size_t i = 0; i < capacities.size(); ++i) {
+    out << "| " << capacities[i] << " | "
+        << std::fixed << std::setprecision(2) << (hitRate(fifoResults[i], totalAccesses) * 100.0) << "% | "
+        << (hitRate(lruResults[i], totalAccesses) * 100.0) << "% | "
+        << (hitRate(optResults[i], totalAccesses) * 100.0) << "% | "
+        << winnerLabel(fifoResults[i], lruResults[i], optResults[i]) << " | "
+        << (optResults[i].hits - lruResults[i].hits) << " | "
+        << (optResults[i].hits - fifoResults[i].hits) << " |\n";
+  }
+
+  out << "\n## Policy details\n\n";
+  for (size_t i = 0; i < capacities.size(); ++i) {
+    out << "### Capacity " << capacities[i] << "\n\n";
+    out << "| Policy | Hits | Misses | Cold misses | Reload misses | Evictions | Final cache |\n";
+    out << "| --- | ---: | ---: | ---: | ---: | ---: | --- |\n";
+
+    const auto writePolicyRow = [&](const char* label, const Result& result) {
+      out << "| " << label << " | " << result.hits << " | " << result.misses << " | " << result.coldMisses << " | "
+          << result.reloadMisses << " | " << result.evictions << " | [";
+      for (size_t index = 0; index < result.finalCache.size(); ++index) {
+        if (index) out << ", ";
+        out << result.finalCache[index];
+      }
+      out << "] |\n";
+    };
+
+    writePolicyRow("FIFO", fifoResults[i]);
+    writePolicyRow("LRU", lruResults[i]);
+    writePolicyRow("OPT", optResults[i]);
+    out << "\n";
+  }
+}
+
 int main(int argc, char* argv[]) {
   CommandLineOptions options;
   try {
     options = parseOptions(argc, argv);
   } catch (const std::exception& error) {
-    std::cerr << "Usage: cache_policy_sim <trace_file> <cache_capacity|start-end|c1,c2,...> [--csv-out report.csv]\n";
+    std::cerr << "Usage: cache_policy_sim <trace_file> <cache_capacity|start-end|c1,c2,...> "
+                 "[--csv-out report.csv] [--markdown-out report.md]\n";
     if (std::string(error.what()) != "Usage") {
       std::cerr << error.what() << "\n";
     }
@@ -410,6 +486,17 @@ int main(int argc, char* argv[]) {
       writeCsvReport(options.csvOutPath, options.capacities, fifoResults, lruResults, optResults, stats,
                      static_cast<int>(trace.size()));
       std::cout << "CSV report: " << options.csvOutPath << "\n\n";
+    } catch (const std::exception& error) {
+      std::cerr << error.what() << "\n";
+      return 1;
+    }
+  }
+
+  if (!options.markdownOutPath.empty()) {
+    try {
+      writeMarkdownReport(options.markdownOutPath, options.capacities, fifoResults, lruResults, optResults, stats,
+                          static_cast<int>(trace.size()));
+      std::cout << "Markdown report: " << options.markdownOutPath << "\n\n";
     } catch (const std::exception& error) {
       std::cerr << error.what() << "\n";
       return 1;

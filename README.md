@@ -31,6 +31,12 @@ Write the comparison table to CSV for lab notes or spreadsheet review:
 ./cache_policy_sim sample_trace.txt 2-6 --csv-out reports/cache-sweep.csv
 ```
 
+Write a Markdown brief you can drop into notes or a PR:
+
+```bash
+./cache_policy_sim sample_trace.txt 2-6 --markdown-out reports/cache-sweep.md
+```
+
 Arguments:
 
 - `trace_file`: Text file with integer keys (space or comma separated)
@@ -51,6 +57,7 @@ Arguments:
 - Capacity-sweep table showing where FIFO/LRU diverge as cache size grows
 - Belady anomaly check that flags when FIFO gets worse after adding capacity
 - Optional CSV export with one row per policy/capacity pair
+- Optional Markdown brief with a sweep table plus per-capacity policy details
 
 ## Example workload
 
