@@ -33,11 +33,24 @@ struct TraceStats {
   int hottestKeyCount = 0;
 };
 
+struct PhaseSummary {
+  int phaseIndex = 0;
+  int startAccess = 0;
+  int endAccess = 0;
+  TraceStats stats;
+  Result fifo;
+  Result lru;
+  Result opt;
+};
+
 struct CommandLineOptions {
   std::string traceFile;
   std::vector<int> capacities;
   std::string csvOutPath;
   std::string markdownOutPath;
+  std::string jsonOutPath;
+  int phaseWindow = 0;
+  bool selfTest = false;
 };
 
 std::vector<int> parseCapacities(const std::string& raw) {
@@ -301,12 +314,64 @@ double hitRate(const Result& result, int totalAccesses) {
   return totalAccesses > 0 ? static_cast<double>(result.hits) / static_cast<double>(totalAccesses) : 0.0;
 }
 
+const char* winnerLabel(const Result& fifoResult, const Result& lruResult, const Result& optResult);
+
+std::vector<PhaseSummary> buildPhaseSummaries(const std::vector<int>& trace, int capacity, int phaseWindow) {
+  std::vector<PhaseSummary> phases;
+  if (phaseWindow <= 0) return phases;
+
+  int phaseIndex = 1;
+  for (size_t start = 0; start < trace.size(); start += static_cast<size_t>(phaseWindow)) {
+    const size_t end = std::min(trace.size(), start + static_cast<size_t>(phaseWindow));
+    const std::vector<int> phaseTrace(trace.begin() + static_cast<std::ptrdiff_t>(start),
+                                      trace.begin() + static_cast<std::ptrdiff_t>(end));
+    PhaseSummary summary;
+    summary.phaseIndex = phaseIndex++;
+    summary.startAccess = static_cast<int>(start) + 1;
+    summary.endAccess = static_cast<int>(end);
+    summary.stats = analyzeTrace(phaseTrace);
+    summary.fifo = runSimulation(phaseTrace, capacity, Policy::FIFO);
+    summary.lru = runSimulation(phaseTrace, capacity, Policy::LRU);
+    summary.opt = runSimulation(phaseTrace, capacity, Policy::OPT);
+    phases.push_back(summary);
+  }
+
+  return phases;
+}
+
+void printPhaseSummary(const std::vector<PhaseSummary>& phases, int phaseCapacity) {
+  if (phases.empty()) return;
+
+  std::cout << "\nPhase-local summary (window " << (phases.front().endAccess - phases.front().startAccess + 1)
+            << ", capacity " << phaseCapacity << ")\n";
+  std::cout << "Phase | Access range | Unique keys | Reuse rate | FIFO hit% | LRU hit% | OPT hit% | Winner\n";
+  for (const PhaseSummary& phase : phases) {
+    const int accesses = phase.endAccess - phase.startAccess + 1;
+    const double reuseRate =
+        accesses > 0 ? static_cast<double>(phase.stats.repeatedAccesses) / static_cast<double>(accesses) : 0.0;
+    std::cout << std::setw(5) << phase.phaseIndex << " | "
+              << std::setw(3) << phase.startAccess << "-" << std::setw(3) << phase.endAccess << " | "
+              << std::setw(11) << phase.stats.uniqueKeys << " | "
+              << std::setw(9) << std::fixed << std::setprecision(2) << (reuseRate * 100.0) << "% | "
+              << std::setw(8) << (hitRate(phase.fifo, accesses) * 100.0) << "% | "
+              << std::setw(7) << (hitRate(phase.lru, accesses) * 100.0) << "% | "
+              << std::setw(7) << (hitRate(phase.opt, accesses) * 100.0) << "% | "
+              << std::setw(6) << winnerLabel(phase.fifo, phase.lru, phase.opt) << "\n";
+  }
+}
+
 const char* winnerLabel(const Result& fifoResult, const Result& lruResult, const Result& optResult) {
   const int bestHits = std::max({fifoResult.hits, lruResult.hits, optResult.hits});
   return bestHits == optResult.hits ? "OPT" : (bestHits == lruResult.hits ? "LRU" : "FIFO");
 }
 
 CommandLineOptions parseOptions(int argc, char* argv[]) {
+  if (argc == 2 && std::string(argv[1]) == "--self-test") {
+    CommandLineOptions options;
+    options.selfTest = true;
+    return options;
+  }
+
   if (argc < 3) {
     throw std::invalid_argument("Usage");
   }
@@ -329,6 +394,23 @@ CommandLineOptions parseOptions(int argc, char* argv[]) {
         throw std::invalid_argument("Missing Markdown output path after --markdown-out.");
       }
       options.markdownOutPath = argv[++index];
+      continue;
+    }
+    if (arg == "--json-out") {
+      if (index + 1 >= argc) {
+        throw std::invalid_argument("Missing JSON output path after --json-out.");
+      }
+      options.jsonOutPath = argv[++index];
+      continue;
+    }
+    if (arg == "--phase-window") {
+      if (index + 1 >= argc) {
+        throw std::invalid_argument("Missing integer value after --phase-window.");
+      }
+      options.phaseWindow = std::stoi(argv[++index]);
+      if (options.phaseWindow <= 0) {
+        throw std::invalid_argument("Phase window must be positive.");
+      }
       continue;
     }
     throw std::invalid_argument("Unknown argument: " + arg);
@@ -371,7 +453,8 @@ void writeCsvReport(const std::string& path, const std::vector<int>& capacities,
 
 void writeMarkdownReport(const std::string& path, const std::vector<int>& capacities,
                          const std::vector<Result>& fifoResults, const std::vector<Result>& lruResults,
-                         const std::vector<Result>& optResults, const TraceStats& stats, int totalAccesses) {
+                         const std::vector<Result>& optResults, const TraceStats& stats, int totalAccesses,
+                         const std::vector<PhaseSummary>& phaseSummaries, int phaseCapacity) {
   const std::filesystem::path outputPath(path);
   if (!outputPath.parent_path().empty()) {
     std::filesystem::create_directories(outputPath.parent_path());
@@ -404,6 +487,26 @@ void writeMarkdownReport(const std::string& path, const std::vector<int>& capaci
         << (optResults[i].hits - fifoResults[i].hits) << " |\n";
   }
 
+  if (!phaseSummaries.empty()) {
+    out << "\n## Phase-local summary\n\n";
+    out << "Phase-local analysis resets the cache at each window so locality shifts are easier to compare.\n\n";
+    out << "- Phase window: `" << (phaseSummaries.front().endAccess - phaseSummaries.front().startAccess + 1) << "` accesses\n";
+    out << "- Phase capacity: `" << phaseCapacity << "`\n\n";
+    out << "| Phase | Access range | Unique keys | Reuse rate | FIFO hit % | LRU hit % | OPT hit % | Winner |\n";
+    out << "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |\n";
+    for (const PhaseSummary& phase : phaseSummaries) {
+      const int accesses = phase.endAccess - phase.startAccess + 1;
+      const double reuseRate =
+          accesses > 0 ? static_cast<double>(phase.stats.repeatedAccesses) / static_cast<double>(accesses) : 0.0;
+      out << "| " << phase.phaseIndex << " | " << phase.startAccess << "-" << phase.endAccess << " | "
+          << phase.stats.uniqueKeys << " | " << std::fixed << std::setprecision(2) << (reuseRate * 100.0) << "% | "
+          << (hitRate(phase.fifo, accesses) * 100.0) << "% | "
+          << (hitRate(phase.lru, accesses) * 100.0) << "% | "
+          << (hitRate(phase.opt, accesses) * 100.0) << "% | "
+          << winnerLabel(phase.fifo, phase.lru, phase.opt) << " |\n";
+    }
+  }
+
   out << "\n## Policy details\n\n";
   for (size_t i = 0; i < capacities.size(); ++i) {
     out << "### Capacity " << capacities[i] << "\n\n";
@@ -427,17 +530,163 @@ void writeMarkdownReport(const std::string& path, const std::vector<int>& capaci
   }
 }
 
+void writeJsonReport(const std::string& path, const std::vector<int>& capacities, const std::vector<Result>& fifoResults,
+                     const std::vector<Result>& lruResults, const std::vector<Result>& optResults,
+                     const TraceStats& stats, int totalAccesses, const std::vector<PhaseSummary>& phaseSummaries,
+                     int phaseCapacity) {
+  const std::filesystem::path outputPath(path);
+  if (!outputPath.parent_path().empty()) {
+    std::filesystem::create_directories(outputPath.parent_path());
+  }
+
+  std::ofstream out(outputPath);
+  if (!out.is_open()) {
+    throw std::runtime_error("Could not open JSON output path: " + path);
+  }
+
+  const double reuseRate =
+      totalAccesses > 0 ? static_cast<double>(stats.repeatedAccesses) / static_cast<double>(totalAccesses) : 0.0;
+
+  const auto writeFinalCache = [&](const Result& result) {
+    out << "[";
+    for (size_t i = 0; i < result.finalCache.size(); ++i) {
+      if (i) out << ", ";
+      out << result.finalCache[i];
+    }
+    out << "]";
+  };
+
+  const auto writeResultObject = [&](const Result& result, int accesses) {
+    out << "{"
+        << "\"hits\":" << result.hits << ","
+        << "\"misses\":" << result.misses << ","
+        << "\"cold_misses\":" << result.coldMisses << ","
+        << "\"reload_misses\":" << result.reloadMisses << ","
+        << "\"evictions\":" << result.evictions << ","
+        << "\"hit_rate\":" << std::fixed << std::setprecision(4) << hitRate(result, accesses) << ","
+        << "\"final_cache\":";
+    writeFinalCache(result);
+    out << "}";
+  };
+
+  out << "{\n";
+  out << "  \"trace\": {\n";
+  out << "    \"accesses\": " << totalAccesses << ",\n";
+  out << "    \"unique_keys\": " << stats.uniqueKeys << ",\n";
+  out << "    \"reuse_rate\": " << std::fixed << std::setprecision(4) << reuseRate << ",\n";
+  out << "    \"hottest_key\": " << stats.hottestKey << ",\n";
+  out << "    \"hottest_key_count\": " << stats.hottestKeyCount << "\n";
+  out << "  },\n";
+  out << "  \"capacity_sweep\": [\n";
+  for (size_t i = 0; i < capacities.size(); ++i) {
+    out << "    {\n";
+    out << "      \"capacity\": " << capacities[i] << ",\n";
+    out << "      \"winner\": \"" << winnerLabel(fifoResults[i], lruResults[i], optResults[i]) << "\",\n";
+    out << "      \"lru_regret\": " << (optResults[i].hits - lruResults[i].hits) << ",\n";
+    out << "      \"fifo_regret\": " << (optResults[i].hits - fifoResults[i].hits) << ",\n";
+    out << "      \"fifo\": ";
+    writeResultObject(fifoResults[i], totalAccesses);
+    out << ",\n      \"lru\": ";
+    writeResultObject(lruResults[i], totalAccesses);
+    out << ",\n      \"opt\": ";
+    writeResultObject(optResults[i], totalAccesses);
+    out << "\n    }";
+    if (i + 1 != capacities.size()) out << ",";
+    out << "\n";
+  }
+  out << "  ]";
+
+  if (!phaseSummaries.empty()) {
+    out << ",\n  \"phase_local\": {\n";
+    out << "    \"capacity\": " << phaseCapacity << ",\n";
+    out << "    \"window\": " << (phaseSummaries.front().endAccess - phaseSummaries.front().startAccess + 1) << ",\n";
+    out << "    \"phases\": [\n";
+    for (size_t i = 0; i < phaseSummaries.size(); ++i) {
+      const PhaseSummary& phase = phaseSummaries[i];
+      const int accesses = phase.endAccess - phase.startAccess + 1;
+      const double phaseReuseRate =
+          accesses > 0 ? static_cast<double>(phase.stats.repeatedAccesses) / static_cast<double>(accesses) : 0.0;
+      out << "      {\n";
+      out << "        \"phase\": " << phase.phaseIndex << ",\n";
+      out << "        \"start_access\": " << phase.startAccess << ",\n";
+      out << "        \"end_access\": " << phase.endAccess << ",\n";
+      out << "        \"unique_keys\": " << phase.stats.uniqueKeys << ",\n";
+      out << "        \"reuse_rate\": " << std::fixed << std::setprecision(4) << phaseReuseRate << ",\n";
+      out << "        \"winner\": \"" << winnerLabel(phase.fifo, phase.lru, phase.opt) << "\",\n";
+      out << "        \"fifo\": ";
+      writeResultObject(phase.fifo, accesses);
+      out << ",\n        \"lru\": ";
+      writeResultObject(phase.lru, accesses);
+      out << ",\n        \"opt\": ";
+      writeResultObject(phase.opt, accesses);
+      out << "\n      }";
+      if (i + 1 != phaseSummaries.size()) out << ",";
+      out << "\n";
+    }
+    out << "    ]\n";
+    out << "  }\n";
+  } else {
+    out << "\n";
+  }
+
+  out << "}\n";
+}
+
+bool runSelfTest() {
+  auto require = [](bool condition, const std::string& message) {
+    if (!condition) {
+      throw std::runtime_error(message);
+    }
+  };
+
+  const std::vector<int> capacities = parseCapacities("4,2,4,3");
+  require(capacities == std::vector<int>({2, 3, 4}), "Capacity parsing should sort and dedupe values.");
+
+  std::istringstream traceStream(std::string("\xEF\xBB\xBF") + "1,2,3\n2 1");
+  const std::vector<int> parsedTrace = parseTrace(traceStream);
+  require(parsedTrace == std::vector<int>({1, 2, 3, 2, 1}), "Trace parsing should support BOM, commas, and spaces.");
+
+  const std::vector<int> lruTrace = {1, 2, 1, 3, 1, 2};
+  const Result lruResult = runSimulation(lruTrace, 2, Policy::LRU);
+  require(lruResult.hits == 2 && lruResult.misses == 4, "LRU baseline counts changed unexpectedly.");
+  require(lruResult.coldMisses == 3 && lruResult.reloadMisses == 1, "LRU miss classification changed unexpectedly.");
+
+  const std::vector<int> anomalyTrace = {1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5};
+  const Result fifoThree = runSimulation(anomalyTrace, 3, Policy::FIFO);
+  const Result fifoFour = runSimulation(anomalyTrace, 4, Policy::FIFO);
+  require(fifoThree.misses == 9 && fifoFour.misses == 10, "FIFO Belady anomaly regression failed.");
+
+  const std::vector<PhaseSummary> phases = buildPhaseSummaries(anomalyTrace, 3, 4);
+  require(phases.size() == 3, "Phase summary count should match trace windowing.");
+  require(phases.front().startAccess == 1 && phases.front().endAccess == 4, "Phase boundaries are incorrect.");
+
+  std::cout << "Self-test passed: parsing, miss classification, Belady anomaly, and phase summaries are stable.\n";
+  return true;
+}
+
 int main(int argc, char* argv[]) {
   CommandLineOptions options;
   try {
     options = parseOptions(argc, argv);
   } catch (const std::exception& error) {
     std::cerr << "Usage: cache_policy_sim <trace_file> <cache_capacity|start-end|c1,c2,...> "
-                 "[--csv-out report.csv] [--markdown-out report.md]\n";
+                 "[--csv-out report.csv] [--markdown-out report.md] [--json-out report.json] "
+                 "[--phase-window accesses]\n"
+                 "   or: cache_policy_sim --self-test\n";
     if (std::string(error.what()) != "Usage") {
       std::cerr << error.what() << "\n";
     }
     return 1;
+  }
+
+  if (options.selfTest) {
+    try {
+      runSelfTest();
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << "Self-test failed: " << error.what() << "\n";
+      return 1;
+    }
   }
 
   std::ifstream file(options.traceFile);
@@ -481,6 +730,9 @@ int main(int argc, char* argv[]) {
     optResults.push_back(runSimulation(trace, capacity, Policy::OPT));
   }
 
+  const int phaseCapacity = options.capacities.back();
+  const std::vector<PhaseSummary> phaseSummaries = buildPhaseSummaries(trace, phaseCapacity, options.phaseWindow);
+
   if (!options.csvOutPath.empty()) {
     try {
       writeCsvReport(options.csvOutPath, options.capacities, fifoResults, lruResults, optResults, stats,
@@ -495,8 +747,19 @@ int main(int argc, char* argv[]) {
   if (!options.markdownOutPath.empty()) {
     try {
       writeMarkdownReport(options.markdownOutPath, options.capacities, fifoResults, lruResults, optResults, stats,
-                          static_cast<int>(trace.size()));
+                          static_cast<int>(trace.size()), phaseSummaries, phaseCapacity);
       std::cout << "Markdown report: " << options.markdownOutPath << "\n\n";
+    } catch (const std::exception& error) {
+      std::cerr << error.what() << "\n";
+      return 1;
+    }
+  }
+
+  if (!options.jsonOutPath.empty()) {
+    try {
+      writeJsonReport(options.jsonOutPath, options.capacities, fifoResults, lruResults, optResults, stats,
+                      static_cast<int>(trace.size()), phaseSummaries, phaseCapacity);
+      std::cout << "JSON report: " << options.jsonOutPath << "\n\n";
     } catch (const std::exception& error) {
       std::cerr << error.what() << "\n";
       return 1;
@@ -522,11 +785,13 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "LRU regret vs OPT: " << lruRegret << " hit(s)\n";
     std::cout << "FIFO regret vs OPT: " << fifoRegret << " hit(s)\n";
+    printPhaseSummary(phaseSummaries, phaseCapacity);
     return 0;
   }
 
   printSweepSummary(options.capacities, fifoResults, lruResults, optResults, static_cast<int>(trace.size()));
   printBeladyAlerts(options.capacities, fifoResults, lruResults);
+  printPhaseSummary(phaseSummaries, phaseCapacity);
 
   return 0;
 }
