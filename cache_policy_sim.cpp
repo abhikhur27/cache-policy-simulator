@@ -24,6 +24,10 @@ struct Result {
   int reloadMisses = 0;
   int evictions = 0;
   std::vector<int> finalCache;
+  std::unordered_map<int, int> keyHits;
+  std::unordered_map<int, int> keyColdMisses;
+  std::unordered_map<int, int> keyReloadMisses;
+  std::unordered_map<int, int> keyEvictions;
 };
 
 struct TraceStats {
@@ -50,8 +54,57 @@ struct CommandLineOptions {
   std::string markdownOutPath;
   std::string jsonOutPath;
   int phaseWindow = 0;
+  int topKeys = 5;
   bool selfTest = false;
 };
+
+struct KeyPressureRow {
+  int key = 0;
+  int hits = 0;
+  int coldMisses = 0;
+  int reloadMisses = 0;
+  int evictions = 0;
+  int totalMisses = 0;
+};
+
+int mapValueOrZero(const std::unordered_map<int, int>& values, int key) {
+  const auto found = values.find(key);
+  return found == values.end() ? 0 : found->second;
+}
+
+std::vector<KeyPressureRow> buildKeyPressureRows(const Result& result, int limit) {
+  std::unordered_set<int> keys;
+  for (const auto& entry : result.keyHits) keys.insert(entry.first);
+  for (const auto& entry : result.keyColdMisses) keys.insert(entry.first);
+  for (const auto& entry : result.keyReloadMisses) keys.insert(entry.first);
+  for (const auto& entry : result.keyEvictions) keys.insert(entry.first);
+
+  std::vector<KeyPressureRow> rows;
+  rows.reserve(keys.size());
+  for (int key : keys) {
+    KeyPressureRow row;
+    row.key = key;
+    row.hits = mapValueOrZero(result.keyHits, key);
+    row.coldMisses = mapValueOrZero(result.keyColdMisses, key);
+    row.reloadMisses = mapValueOrZero(result.keyReloadMisses, key);
+    row.evictions = mapValueOrZero(result.keyEvictions, key);
+    row.totalMisses = row.coldMisses + row.reloadMisses;
+    rows.push_back(row);
+  }
+
+  std::sort(rows.begin(), rows.end(), [](const KeyPressureRow& left, const KeyPressureRow& right) {
+    if (left.reloadMisses != right.reloadMisses) return left.reloadMisses > right.reloadMisses;
+    if (left.evictions != right.evictions) return left.evictions > right.evictions;
+    if (left.totalMisses != right.totalMisses) return left.totalMisses > right.totalMisses;
+    if (left.hits != right.hits) return left.hits > right.hits;
+    return left.key < right.key;
+  });
+
+  if (limit > 0 && static_cast<int>(rows.size()) > limit) {
+    rows.resize(static_cast<size_t>(limit));
+  }
+  return rows;
+}
 
 std::vector<int> parseCapacities(const std::string& raw) {
   std::vector<int> capacities;
@@ -135,14 +188,17 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy)
 
       if (cacheSet.find(key) != cacheSet.end()) {
         result.hits += 1;
+        result.keyHits[key] += 1;
         continue;
       }
 
       result.misses += 1;
       if (seenKeys.insert(key).second) {
         result.coldMisses += 1;
+        result.keyColdMisses[key] += 1;
       } else {
         result.reloadMisses += 1;
+        result.keyReloadMisses[key] += 1;
       }
 
       if (static_cast<int>(cache.size()) >= capacity) {
@@ -157,9 +213,11 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy)
             victimIndex = cacheIndex;
           }
         }
-        cacheSet.erase(cache[victimIndex]);
+        const int evictedKey = cache[victimIndex];
+        cacheSet.erase(evictedKey);
         cache.erase(cache.begin() + static_cast<std::ptrdiff_t>(victimIndex));
         result.evictions += 1;
+        result.keyEvictions[evictedKey] += 1;
       }
 
       cache.push_back(key);
@@ -182,6 +240,7 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy)
     auto found = positions.find(key);
     if (found != positions.end()) {
       result.hits += 1;
+      result.keyHits[key] += 1;
       if (policy == Policy::LRU) {
         const int index = found->second;
         const int value = cache[static_cast<size_t>(index)];
@@ -197,13 +256,17 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy)
     result.misses += 1;
     if (seenKeys.insert(key).second) {
       result.coldMisses += 1;
+      result.keyColdMisses[key] += 1;
     } else {
       result.reloadMisses += 1;
+      result.keyReloadMisses[key] += 1;
     }
     if (static_cast<int>(cache.size()) >= capacity) {
-      positions.erase(cache.front());
+      const int evictedKey = cache.front();
+      positions.erase(evictedKey);
       cache.erase(cache.begin());
       result.evictions += 1;
+      result.keyEvictions[evictedKey] += 1;
     }
     cache.push_back(key);
     positions[key] = static_cast<int>(cache.size() - 1);
@@ -247,6 +310,21 @@ void printResult(const std::string& label, const Result& result, int totalAccess
     std::cout << result.finalCache[i];
   }
   std::cout << "]\n";
+}
+
+void printKeyPressureSummary(const std::string& label, const Result& result, int topKeys) {
+  const std::vector<KeyPressureRow> rows = buildKeyPressureRows(result, topKeys);
+  if (rows.empty()) return;
+
+  std::cout << label << " key pressure (top " << rows.size() << ")\n";
+  std::cout << "  Key | Reload misses | Cold misses | Evictions | Hits\n";
+  for (const KeyPressureRow& row : rows) {
+    std::cout << std::setw(5) << row.key << " | "
+              << std::setw(14) << row.reloadMisses << " | "
+              << std::setw(11) << row.coldMisses << " | "
+              << std::setw(9) << row.evictions << " | "
+              << std::setw(4) << row.hits << "\n";
+  }
 }
 
 void printSweepSummary(const std::vector<int>& capacities, const std::vector<Result>& fifoResults,
@@ -413,6 +491,16 @@ CommandLineOptions parseOptions(int argc, char* argv[]) {
       }
       continue;
     }
+    if (arg == "--top-keys") {
+      if (index + 1 >= argc) {
+        throw std::invalid_argument("Missing integer value after --top-keys.");
+      }
+      options.topKeys = std::stoi(argv[++index]);
+      if (options.topKeys <= 0) {
+        throw std::invalid_argument("Top-key count must be positive.");
+      }
+      continue;
+    }
     throw std::invalid_argument("Unknown argument: " + arg);
   }
 
@@ -454,7 +542,7 @@ void writeCsvReport(const std::string& path, const std::vector<int>& capacities,
 void writeMarkdownReport(const std::string& path, const std::vector<int>& capacities,
                          const std::vector<Result>& fifoResults, const std::vector<Result>& lruResults,
                          const std::vector<Result>& optResults, const TraceStats& stats, int totalAccesses,
-                         const std::vector<PhaseSummary>& phaseSummaries, int phaseCapacity) {
+                         const std::vector<PhaseSummary>& phaseSummaries, int phaseCapacity, int topKeys) {
   const std::filesystem::path outputPath(path);
   if (!outputPath.parent_path().empty()) {
     std::filesystem::create_directories(outputPath.parent_path());
@@ -527,13 +615,30 @@ void writeMarkdownReport(const std::string& path, const std::vector<int>& capaci
     writePolicyRow("LRU", lruResults[i]);
     writePolicyRow("OPT", optResults[i]);
     out << "\n";
+
+    const auto writeKeyPressureTable = [&](const char* label, const Result& result) {
+      const std::vector<KeyPressureRow> rows = buildKeyPressureRows(result, topKeys);
+      if (rows.empty()) return;
+      out << "#### " << label << " key pressure\n\n";
+      out << "| Key | Reload misses | Cold misses | Evictions | Hits |\n";
+      out << "| --- | ---: | ---: | ---: | ---: |\n";
+      for (const KeyPressureRow& row : rows) {
+        out << "| " << row.key << " | " << row.reloadMisses << " | " << row.coldMisses << " | "
+            << row.evictions << " | " << row.hits << " |\n";
+      }
+      out << "\n";
+    };
+
+    writeKeyPressureTable("FIFO", fifoResults[i]);
+    writeKeyPressureTable("LRU", lruResults[i]);
+    writeKeyPressureTable("OPT", optResults[i]);
   }
 }
 
 void writeJsonReport(const std::string& path, const std::vector<int>& capacities, const std::vector<Result>& fifoResults,
                      const std::vector<Result>& lruResults, const std::vector<Result>& optResults,
                      const TraceStats& stats, int totalAccesses, const std::vector<PhaseSummary>& phaseSummaries,
-                     int phaseCapacity) {
+                     int phaseCapacity, int topKeys) {
   const std::filesystem::path outputPath(path);
   if (!outputPath.parent_path().empty()) {
     std::filesystem::create_directories(outputPath.parent_path());
@@ -557,6 +662,7 @@ void writeJsonReport(const std::string& path, const std::vector<int>& capacities
   };
 
   const auto writeResultObject = [&](const Result& result, int accesses) {
+    const std::vector<KeyPressureRow> keyPressure = buildKeyPressureRows(result, topKeys);
     out << "{"
         << "\"hits\":" << result.hits << ","
         << "\"misses\":" << result.misses << ","
@@ -566,7 +672,19 @@ void writeJsonReport(const std::string& path, const std::vector<int>& capacities
         << "\"hit_rate\":" << std::fixed << std::setprecision(4) << hitRate(result, accesses) << ","
         << "\"final_cache\":";
     writeFinalCache(result);
-    out << "}";
+    out << ",\"key_pressure\":[";
+    for (size_t i = 0; i < keyPressure.size(); ++i) {
+      const KeyPressureRow& row = keyPressure[i];
+      if (i) out << ",";
+      out << "{"
+          << "\"key\":" << row.key << ","
+          << "\"hits\":" << row.hits << ","
+          << "\"cold_misses\":" << row.coldMisses << ","
+          << "\"reload_misses\":" << row.reloadMisses << ","
+          << "\"evictions\":" << row.evictions
+          << "}";
+    }
+    out << "]}";
   };
 
   out << "{\n";
@@ -650,11 +768,18 @@ bool runSelfTest() {
   const Result lruResult = runSimulation(lruTrace, 2, Policy::LRU);
   require(lruResult.hits == 2 && lruResult.misses == 4, "LRU baseline counts changed unexpectedly.");
   require(lruResult.coldMisses == 3 && lruResult.reloadMisses == 1, "LRU miss classification changed unexpectedly.");
+  require(mapValueOrZero(lruResult.keyHits, 1) == 2 && mapValueOrZero(lruResult.keyReloadMisses, 2) == 1,
+          "Per-key hit/reload accounting changed unexpectedly.");
+  require(mapValueOrZero(lruResult.keyEvictions, 2) == 1 && mapValueOrZero(lruResult.keyEvictions, 1) == 1,
+          "Per-key eviction accounting changed unexpectedly.");
 
   const std::vector<int> anomalyTrace = {1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5};
   const Result fifoThree = runSimulation(anomalyTrace, 3, Policy::FIFO);
   const Result fifoFour = runSimulation(anomalyTrace, 4, Policy::FIFO);
   require(fifoThree.misses == 9 && fifoFour.misses == 10, "FIFO Belady anomaly regression failed.");
+  const std::vector<KeyPressureRow> pressureRows = buildKeyPressureRows(fifoThree, 2);
+  require(pressureRows.size() == 2 && pressureRows.front().reloadMisses >= pressureRows.back().reloadMisses,
+          "Key-pressure ranking should stay deterministic.");
 
   const std::vector<PhaseSummary> phases = buildPhaseSummaries(anomalyTrace, 3, 4);
   require(phases.size() == 3, "Phase summary count should match trace windowing.");
@@ -671,7 +796,7 @@ int main(int argc, char* argv[]) {
   } catch (const std::exception& error) {
     std::cerr << "Usage: cache_policy_sim <trace_file> <cache_capacity|start-end|c1,c2,...> "
                  "[--csv-out report.csv] [--markdown-out report.md] [--json-out report.json] "
-                 "[--phase-window accesses]\n"
+                 "[--phase-window accesses] [--top-keys count]\n"
                  "   or: cache_policy_sim --self-test\n";
     if (std::string(error.what()) != "Usage") {
       std::cerr << error.what() << "\n";
@@ -747,7 +872,7 @@ int main(int argc, char* argv[]) {
   if (!options.markdownOutPath.empty()) {
     try {
       writeMarkdownReport(options.markdownOutPath, options.capacities, fifoResults, lruResults, optResults, stats,
-                          static_cast<int>(trace.size()), phaseSummaries, phaseCapacity);
+                          static_cast<int>(trace.size()), phaseSummaries, phaseCapacity, options.topKeys);
       std::cout << "Markdown report: " << options.markdownOutPath << "\n\n";
     } catch (const std::exception& error) {
       std::cerr << error.what() << "\n";
@@ -758,7 +883,7 @@ int main(int argc, char* argv[]) {
   if (!options.jsonOutPath.empty()) {
     try {
       writeJsonReport(options.jsonOutPath, options.capacities, fifoResults, lruResults, optResults, stats,
-                      static_cast<int>(trace.size()), phaseSummaries, phaseCapacity);
+                      static_cast<int>(trace.size()), phaseSummaries, phaseCapacity, options.topKeys);
       std::cout << "JSON report: " << options.jsonOutPath << "\n\n";
     } catch (const std::exception& error) {
       std::cerr << error.what() << "\n";
@@ -768,10 +893,13 @@ int main(int argc, char* argv[]) {
 
   if (options.capacities.size() == 1) {
     printResult("FIFO", fifoResults[0], static_cast<int>(trace.size()));
+    printKeyPressureSummary("FIFO", fifoResults[0], options.topKeys);
     std::cout << "\n";
     printResult("LRU", lruResults[0], static_cast<int>(trace.size()));
+    printKeyPressureSummary("LRU", lruResults[0], options.topKeys);
     std::cout << "\n";
     printResult("OPT", optResults[0], static_cast<int>(trace.size()));
+    printKeyPressureSummary("OPT", optResults[0], options.topKeys);
 
     const int hitDelta = lruResults[0].hits - fifoResults[0].hits;
     const int lruRegret = optResults[0].hits - lruResults[0].hits;

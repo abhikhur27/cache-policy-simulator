@@ -49,6 +49,12 @@ Inspect locality shifts across a long trace with phase-local windows:
 ./cache_policy_sim sample_trace.txt 2-6 --phase-window 6 --markdown-out reports/cache-sweep.md
 ```
 
+Surface the specific keys driving reload churn and evictions:
+
+```bash
+./cache_policy_sim sample_trace.txt 4 --top-keys 8 --markdown-out reports/cache-brief.md --json-out reports/cache-brief.json
+```
+
 Run the built-in regression checks:
 
 ```bash
@@ -60,6 +66,7 @@ Arguments:
 - `trace_file`: Text file with integer keys (space or comma separated)
 - `cache_capacity`: Positive integer cache size, ascending range, or comma-separated list
 - `--phase-window N`: Optional phase-local analysis window size in accesses. Uses the largest requested capacity.
+- `--top-keys N`: Optional number of per-policy hot/churn keys to include in console, Markdown, and JSON diagnostics.
 - `--json-out path`: Optional machine-readable report with sweep and phase-local metrics.
 - `--self-test`: Runs deterministic parser/simulation regression checks without a trace file.
 
@@ -75,6 +82,7 @@ Arguments:
   - hottest key frequency
 - Final cache contents
 - Winner summary showing hit-count delta plus regret versus OPT
+- Per-policy key pressure tables showing which keys drive reload misses and evictions
 - Capacity-sweep table showing where FIFO/LRU diverge as cache size grows
 - Belady anomaly check that flags when FIFO gets worse after adding capacity
 - Optional phase-local table that resets the cache per window so changing locality is easy to spot
@@ -91,10 +99,10 @@ Arguments:
 ```bash
 zig c++ -std=c++17 -O2 -Wall -Wextra -pedantic cache_policy_sim.cpp -o cache_policy_sim
 ./cache_policy_sim --self-test
-./cache_policy_sim sample_trace.txt 2-4 --phase-window 6 --markdown-out reports/cache-sweep.md --json-out reports/cache-sweep.json
+./cache_policy_sim sample_trace.txt 2-4 --phase-window 6 --top-keys 6 --markdown-out reports/cache-sweep.md --json-out reports/cache-sweep.json
 ```
 
-That run should pass the self-test, print the trace profile, emit the sweep plus Belady check, and include a phase-local summary.
+That run should pass the self-test, print the trace profile, emit the sweep plus Belady check, and include both phase-local and per-key pressure summaries.
 
 ## Portfolio Demo Script
 
