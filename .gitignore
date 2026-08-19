@@ -1,0 +1,5 @@
+/cache_policy_sim
+/cache_policy_sim.exe
+*.obj
+*.pdb
+/reports/

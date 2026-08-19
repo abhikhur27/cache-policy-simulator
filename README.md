@@ -49,6 +49,14 @@ Inspect locality shifts across a long trace with phase-local windows:
 ./cache_policy_sim sample_trace.txt 2-6 --phase-window 6 --markdown-out reports/cache-sweep.md
 ```
 
+Run the deterministic three-regime fixture to verify that policy advice changes with the workload:
+
+```bash
+./cache_policy_sim fixtures/multi_phase_trace.txt 3 --phase-window 12
+```
+
+The fixture contains an LRU-favoring locality phase, a FIFO-favoring cyclic scan, and a hot set that fits entirely. The phase table reports the deployable online choice and LRU hit delta; OPT stays visible as an offline ceiling instead of being presented as the operational recommendation.
+
 Surface the specific keys driving reload churn and evictions:
 
 ```bash
@@ -86,6 +94,8 @@ Arguments:
 - Capacity-sweep table showing where FIFO/LRU diverge as cache size grows
 - Belady anomaly check that flags when FIFO gets worse after adding capacity
 - Optional phase-local table that resets the cache per window so changing locality is easy to spot
+- FIFO-vs-LRU online choice and signed LRU hit delta for every capacity and phase, including CSV/Markdown/JSON exports
+- Phase conclusion counts showing how often LRU leads, FIFO leads, or both tie
 - Optional CSV export with one row per policy/capacity pair
 - Optional Markdown brief with sweep, phase-local, and per-capacity policy details
 - Optional JSON export with sweep metrics, final-cache state, and phase-local results
@@ -99,10 +109,10 @@ Arguments:
 ```bash
 zig c++ -std=c++17 -O2 -Wall -Wextra -pedantic cache_policy_sim.cpp -o cache_policy_sim
 ./cache_policy_sim --self-test
-./cache_policy_sim sample_trace.txt 2-4 --phase-window 6 --top-keys 6 --markdown-out reports/cache-sweep.md --json-out reports/cache-sweep.json
+./cache_policy_sim fixtures/multi_phase_trace.txt 3 --phase-window 12 --top-keys 6 --markdown-out reports/cache-sweep.md --json-out reports/cache-sweep.json
 ```
 
-That run should pass the self-test, print the trace profile, emit the sweep plus Belady check, and include both phase-local and per-key pressure summaries.
+That run should pass the self-test and show one LRU phase, one FIFO phase, and one tie while exporting the same conclusions to Markdown and JSON.
 
 ## Portfolio Demo Script
 

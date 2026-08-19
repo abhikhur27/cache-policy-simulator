@@ -1,0 +1,28 @@
+name: cache-policy-checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with warnings enabled
+        run: g++ -std=c++17 -O2 -Wall -Wextra -pedantic cache_policy_sim.cpp -o cache_policy_sim
+      - name: Run simulation regressions
+        run: ./cache_policy_sim --self-test
+      - name: Verify multi-phase policy contract
+        run: |
+          ./cache_policy_sim fixtures/multi_phase_trace.txt 3 --phase-window 12 --json-out reports/multi-phase.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(Path("reports/multi-phase.json").read_text())
+          phase_local = report["phase_local"]
+          assert phase_local["policy_conclusions"] == {"lru": 1, "fifo": 1, "tie": 1}
+          assert [phase["online_choice"] for phase in phase_local["phases"]] == ["LRU", "FIFO", "TIE"]
+          assert [phase["lru_hit_delta"] for phase in phase_local["phases"]] == [1, -1, 0]
+          PY

@@ -47,6 +47,12 @@ struct PhaseSummary {
   Result opt;
 };
 
+struct PhasePolicyCounts {
+  int lruWins = 0;
+  int fifoWins = 0;
+  int ties = 0;
+};
+
 struct CommandLineOptions {
   std::string traceFile;
   std::vector<int> capacities;
@@ -327,11 +333,20 @@ void printKeyPressureSummary(const std::string& label, const Result& result, int
   }
 }
 
+int lruHitDelta(const Result& fifoResult, const Result& lruResult) {
+  return lruResult.hits - fifoResult.hits;
+}
+
+const char* onlinePolicyLabel(const Result& fifoResult, const Result& lruResult) {
+  const int delta = lruHitDelta(fifoResult, lruResult);
+  return delta > 0 ? "LRU" : (delta < 0 ? "FIFO" : "TIE");
+}
+
 void printSweepSummary(const std::vector<int>& capacities, const std::vector<Result>& fifoResults,
                        const std::vector<Result>& lruResults, const std::vector<Result>& optResults,
                        int totalAccesses) {
   std::cout << "Capacity sweep\n";
-  std::cout << "Cap | FIFO hit% | LRU hit% | OPT hit% | Winner | LRU regret | FIFO regret\n";
+  std::cout << "Cap | FIFO hit% | LRU hit% | OPT hit% | Online pick | LRU delta | LRU regret | FIFO regret\n";
   for (size_t i = 0; i < capacities.size(); ++i) {
     const double fifoRate =
         totalAccesses > 0 ? static_cast<double>(fifoResults[i].hits) / static_cast<double>(totalAccesses) : 0.0;
@@ -339,14 +354,14 @@ void printSweepSummary(const std::vector<int>& capacities, const std::vector<Res
         totalAccesses > 0 ? static_cast<double>(lruResults[i].hits) / static_cast<double>(totalAccesses) : 0.0;
     const double optRate =
         totalAccesses > 0 ? static_cast<double>(optResults[i].hits) / static_cast<double>(totalAccesses) : 0.0;
-    const int bestHits = std::max({fifoResults[i].hits, lruResults[i].hits, optResults[i].hits});
-    const std::string winner = bestHits == optResults[i].hits ? "OPT" : (bestHits == lruResults[i].hits ? "LRU" : "FIFO");
     const int lruRegret = optResults[i].hits - lruResults[i].hits;
     const int fifoRegret = optResults[i].hits - fifoResults[i].hits;
     std::cout << std::setw(3) << capacities[i] << " | " << std::setw(8) << std::fixed << std::setprecision(2)
               << (fifoRate * 100.0) << "% | " << std::setw(7) << (lruRate * 100.0) << "% | " << std::setw(7)
-              << (optRate * 100.0) << "% | " << std::setw(6) << winner << " | " << std::setw(10) << lruRegret
-              << " | " << std::setw(11) << fifoRegret << "\n";
+              << (optRate * 100.0) << "% | " << std::setw(11)
+              << onlinePolicyLabel(fifoResults[i], lruResults[i]) << " | " << std::setw(9)
+              << lruHitDelta(fifoResults[i], lruResults[i]) << " | " << std::setw(10) << lruRegret << " | "
+              << std::setw(11) << fifoRegret << "\n";
   }
 }
 
@@ -394,6 +409,21 @@ double hitRate(const Result& result, int totalAccesses) {
 
 const char* winnerLabel(const Result& fifoResult, const Result& lruResult, const Result& optResult);
 
+PhasePolicyCounts countPhasePolicyConclusions(const std::vector<PhaseSummary>& phases) {
+  PhasePolicyCounts counts;
+  for (const PhaseSummary& phase : phases) {
+    const int delta = lruHitDelta(phase.fifo, phase.lru);
+    if (delta > 0) {
+      counts.lruWins += 1;
+    } else if (delta < 0) {
+      counts.fifoWins += 1;
+    } else {
+      counts.ties += 1;
+    }
+  }
+  return counts;
+}
+
 std::vector<PhaseSummary> buildPhaseSummaries(const std::vector<int>& trace, int capacity, int phaseWindow) {
   std::vector<PhaseSummary> phases;
   if (phaseWindow <= 0) return phases;
@@ -420,9 +450,12 @@ std::vector<PhaseSummary> buildPhaseSummaries(const std::vector<int>& trace, int
 void printPhaseSummary(const std::vector<PhaseSummary>& phases, int phaseCapacity) {
   if (phases.empty()) return;
 
+  const PhasePolicyCounts counts = countPhasePolicyConclusions(phases);
   std::cout << "\nPhase-local summary (window " << (phases.front().endAccess - phases.front().startAccess + 1)
             << ", capacity " << phaseCapacity << ")\n";
-  std::cout << "Phase | Access range | Unique keys | Reuse rate | FIFO hit% | LRU hit% | OPT hit% | Winner\n";
+  std::cout << "Online conclusions: LRU led " << counts.lruWins << ", FIFO led " << counts.fifoWins
+            << ", tied " << counts.ties << ".\n";
+  std::cout << "Phase | Access range | Unique keys | Reuse rate | FIFO hit% | LRU hit% | OPT hit% | Online pick | LRU delta\n";
   for (const PhaseSummary& phase : phases) {
     const int accesses = phase.endAccess - phase.startAccess + 1;
     const double reuseRate =
@@ -434,7 +467,8 @@ void printPhaseSummary(const std::vector<PhaseSummary>& phases, int phaseCapacit
               << std::setw(8) << (hitRate(phase.fifo, accesses) * 100.0) << "% | "
               << std::setw(7) << (hitRate(phase.lru, accesses) * 100.0) << "% | "
               << std::setw(7) << (hitRate(phase.opt, accesses) * 100.0) << "% | "
-              << std::setw(6) << winnerLabel(phase.fifo, phase.lru, phase.opt) << "\n";
+              << std::setw(11) << onlinePolicyLabel(phase.fifo, phase.lru) << " | "
+              << std::setw(9) << lruHitDelta(phase.fifo, phase.lru) << "\n";
   }
 }
 
@@ -522,20 +556,24 @@ void writeCsvReport(const std::string& path, const std::vector<int>& capacities,
   const double reuseRate =
       totalAccesses > 0 ? static_cast<double>(stats.repeatedAccesses) / static_cast<double>(totalAccesses) : 0.0;
 
-  out << "capacity,policy,hits,misses,cold_misses,reload_misses,evictions,hit_rate,unique_keys,reuse_rate,hottest_key,"
-         "hottest_key_count\n";
+  out << "capacity,policy,hits,misses,cold_misses,reload_misses,evictions,hit_rate,online_choice,lru_hit_delta,"
+         "unique_keys,reuse_rate,hottest_key,hottest_key_count\n";
 
-  const auto writeRow = [&](int capacity, const char* policy, const Result& result) {
+  const auto writeRow = [&](int capacity, const char* policy, const Result& result, const char* onlineChoice,
+                            int lruDelta) {
     const double hitRate = totalAccesses > 0 ? static_cast<double>(result.hits) / static_cast<double>(totalAccesses) : 0.0;
     out << capacity << ',' << policy << ',' << result.hits << ',' << result.misses << ',' << result.coldMisses << ','
         << result.reloadMisses << ',' << result.evictions << ',' << std::fixed << std::setprecision(4) << hitRate << ','
-        << stats.uniqueKeys << ',' << reuseRate << ',' << stats.hottestKey << ',' << stats.hottestKeyCount << "\n";
+        << onlineChoice << ',' << lruDelta << ',' << stats.uniqueKeys << ',' << reuseRate << ',' << stats.hottestKey
+        << ',' << stats.hottestKeyCount << "\n";
   };
 
   for (size_t i = 0; i < capacities.size(); ++i) {
-    writeRow(capacities[i], "FIFO", fifoResults[i]);
-    writeRow(capacities[i], "LRU", lruResults[i]);
-    writeRow(capacities[i], "OPT", optResults[i]);
+    const char* onlineChoice = onlinePolicyLabel(fifoResults[i], lruResults[i]);
+    const int lruDelta = lruHitDelta(fifoResults[i], lruResults[i]);
+    writeRow(capacities[i], "FIFO", fifoResults[i], onlineChoice, lruDelta);
+    writeRow(capacities[i], "LRU", lruResults[i], onlineChoice, lruDelta);
+    writeRow(capacities[i], "OPT", optResults[i], onlineChoice, lruDelta);
   }
 }
 
@@ -563,25 +601,29 @@ void writeMarkdownReport(const std::string& path, const std::vector<int>& capaci
   out << "- Hottest key: `" << stats.hottestKey << "` with `" << stats.hottestKeyCount << "` accesses\n\n";
 
   out << "## Capacity sweep\n\n";
-  out << "| Capacity | FIFO hit % | LRU hit % | OPT hit % | Winner | LRU regret | FIFO regret |\n";
-  out << "| --- | ---: | ---: | ---: | --- | ---: | ---: |\n";
+  out << "| Capacity | FIFO hit % | LRU hit % | OPT hit % | Online pick | LRU hit delta | LRU regret | FIFO regret |\n";
+  out << "| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: |\n";
   for (size_t i = 0; i < capacities.size(); ++i) {
     out << "| " << capacities[i] << " | "
         << std::fixed << std::setprecision(2) << (hitRate(fifoResults[i], totalAccesses) * 100.0) << "% | "
         << (hitRate(lruResults[i], totalAccesses) * 100.0) << "% | "
         << (hitRate(optResults[i], totalAccesses) * 100.0) << "% | "
-        << winnerLabel(fifoResults[i], lruResults[i], optResults[i]) << " | "
+        << onlinePolicyLabel(fifoResults[i], lruResults[i]) << " | "
+        << lruHitDelta(fifoResults[i], lruResults[i]) << " | "
         << (optResults[i].hits - lruResults[i].hits) << " | "
         << (optResults[i].hits - fifoResults[i].hits) << " |\n";
   }
 
   if (!phaseSummaries.empty()) {
+    const PhasePolicyCounts counts = countPhasePolicyConclusions(phaseSummaries);
     out << "\n## Phase-local summary\n\n";
     out << "Phase-local analysis resets the cache at each window so locality shifts are easier to compare.\n\n";
     out << "- Phase window: `" << (phaseSummaries.front().endAccess - phaseSummaries.front().startAccess + 1) << "` accesses\n";
     out << "- Phase capacity: `" << phaseCapacity << "`\n\n";
-    out << "| Phase | Access range | Unique keys | Reuse rate | FIFO hit % | LRU hit % | OPT hit % | Winner |\n";
-    out << "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |\n";
+    out << "Online policy conclusions: LRU led `" << counts.lruWins << "` phase(s), FIFO led `"
+        << counts.fifoWins << "`, and `" << counts.ties << "` tied. OPT remains the offline ceiling.\n\n";
+    out << "| Phase | Access range | Unique keys | Reuse rate | FIFO hit % | LRU hit % | OPT hit % | Online pick | LRU hit delta |\n";
+    out << "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: |\n";
     for (const PhaseSummary& phase : phaseSummaries) {
       const int accesses = phase.endAccess - phase.startAccess + 1;
       const double reuseRate =
@@ -591,7 +633,8 @@ void writeMarkdownReport(const std::string& path, const std::vector<int>& capaci
           << (hitRate(phase.fifo, accesses) * 100.0) << "% | "
           << (hitRate(phase.lru, accesses) * 100.0) << "% | "
           << (hitRate(phase.opt, accesses) * 100.0) << "% | "
-          << winnerLabel(phase.fifo, phase.lru, phase.opt) << " |\n";
+          << onlinePolicyLabel(phase.fifo, phase.lru) << " | "
+          << lruHitDelta(phase.fifo, phase.lru) << " |\n";
     }
   }
 
@@ -700,6 +743,8 @@ void writeJsonReport(const std::string& path, const std::vector<int>& capacities
     out << "    {\n";
     out << "      \"capacity\": " << capacities[i] << ",\n";
     out << "      \"winner\": \"" << winnerLabel(fifoResults[i], lruResults[i], optResults[i]) << "\",\n";
+    out << "      \"online_choice\": \"" << onlinePolicyLabel(fifoResults[i], lruResults[i]) << "\",\n";
+    out << "      \"lru_hit_delta\": " << lruHitDelta(fifoResults[i], lruResults[i]) << ",\n";
     out << "      \"lru_regret\": " << (optResults[i].hits - lruResults[i].hits) << ",\n";
     out << "      \"fifo_regret\": " << (optResults[i].hits - fifoResults[i].hits) << ",\n";
     out << "      \"fifo\": ";
@@ -715,9 +760,12 @@ void writeJsonReport(const std::string& path, const std::vector<int>& capacities
   out << "  ]";
 
   if (!phaseSummaries.empty()) {
+    const PhasePolicyCounts counts = countPhasePolicyConclusions(phaseSummaries);
     out << ",\n  \"phase_local\": {\n";
     out << "    \"capacity\": " << phaseCapacity << ",\n";
     out << "    \"window\": " << (phaseSummaries.front().endAccess - phaseSummaries.front().startAccess + 1) << ",\n";
+    out << "    \"policy_conclusions\": {\"lru\":" << counts.lruWins << ",\"fifo\":" << counts.fifoWins
+        << ",\"tie\":" << counts.ties << "},\n";
     out << "    \"phases\": [\n";
     for (size_t i = 0; i < phaseSummaries.size(); ++i) {
       const PhaseSummary& phase = phaseSummaries[i];
@@ -731,6 +779,8 @@ void writeJsonReport(const std::string& path, const std::vector<int>& capacities
       out << "        \"unique_keys\": " << phase.stats.uniqueKeys << ",\n";
       out << "        \"reuse_rate\": " << std::fixed << std::setprecision(4) << phaseReuseRate << ",\n";
       out << "        \"winner\": \"" << winnerLabel(phase.fifo, phase.lru, phase.opt) << "\",\n";
+      out << "        \"online_choice\": \"" << onlinePolicyLabel(phase.fifo, phase.lru) << "\",\n";
+      out << "        \"lru_hit_delta\": " << lruHitDelta(phase.fifo, phase.lru) << ",\n";
       out << "        \"fifo\": ";
       writeResultObject(phase.fifo, accesses);
       out << ",\n        \"lru\": ";
@@ -785,7 +835,27 @@ bool runSelfTest() {
   require(phases.size() == 3, "Phase summary count should match trace windowing.");
   require(phases.front().startAccess == 1 && phases.front().endAccess == 4, "Phase boundaries are incorrect.");
 
-  std::cout << "Self-test passed: parsing, miss classification, Belady anomaly, and phase summaries are stable.\n";
+  const std::vector<int> multiPhaseTrace = {
+      1, 2, 3, 1, 4, 1, 2, 3, 1, 4, 1, 2,
+      1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5,
+      7, 8, 9, 7, 8, 9, 7, 8, 9, 7, 8, 9,
+  };
+  const std::vector<PhaseSummary> policyPhases = buildPhaseSummaries(multiPhaseTrace, 3, 12);
+  require(policyPhases.size() == 3, "Multi-phase fixture should produce exactly three policy windows.");
+  require(lruHitDelta(policyPhases[0].fifo, policyPhases[0].lru) == 1 &&
+              std::string(onlinePolicyLabel(policyPhases[0].fifo, policyPhases[0].lru)) == "LRU",
+          "The locality phase should recommend LRU by one hit.");
+  require(lruHitDelta(policyPhases[1].fifo, policyPhases[1].lru) == -1 &&
+              std::string(onlinePolicyLabel(policyPhases[1].fifo, policyPhases[1].lru)) == "FIFO",
+          "The cyclic scan phase should recommend FIFO by one hit.");
+  require(lruHitDelta(policyPhases[2].fifo, policyPhases[2].lru) == 0 &&
+              policyPhases[2].fifo.hits == 9 && policyPhases[2].lru.hits == 9,
+          "The fitting hot-set phase should keep FIFO and LRU tied at nine hits.");
+  const PhasePolicyCounts conclusionCounts = countPhasePolicyConclusions(policyPhases);
+  require(conclusionCounts.lruWins == 1 && conclusionCounts.fifoWins == 1 && conclusionCounts.ties == 1,
+          "Phase conclusion aggregation should preserve one LRU win, one FIFO win, and one tie.");
+
+  std::cout << "Self-test passed: parsing, simulation, key pressure, and multi-phase policy conclusions are stable.\n";
   return true;
 }
 
