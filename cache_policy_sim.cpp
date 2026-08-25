@@ -45,12 +45,24 @@ struct PhaseSummary {
   Result fifo;
   Result lru;
   Result opt;
+  Result continuousFifo;
+  Result continuousLru;
+  Result continuousOpt;
 };
 
 struct PhasePolicyCounts {
   int lruWins = 0;
   int fifoWins = 0;
   int ties = 0;
+};
+
+struct PhaseComparisonSummary {
+  PhasePolicyCounts isolatedCounts;
+  PhasePolicyCounts continuousCounts;
+  int fifoCarryHitDelta = 0;
+  int lruCarryHitDelta = 0;
+  int optCarryHitDelta = 0;
+  int changedOnlineConclusions = 0;
 };
 
 struct CommandLineOptions {
@@ -170,7 +182,36 @@ std::vector<int> parseTrace(std::istream& input) {
   return trace;
 }
 
-Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy) {
+Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy, int phaseWindow = 0,
+                     std::vector<Result>* continuousPhases = nullptr) {
+  Result phaseResult;
+  const auto recordHit = [&](Result& result, int key) {
+    result.hits += 1;
+    result.keyHits[key] += 1;
+  };
+  const auto recordMiss = [&](Result& result, int key, bool isCold) {
+    result.misses += 1;
+    if (isCold) {
+      result.coldMisses += 1;
+      result.keyColdMisses[key] += 1;
+    } else {
+      result.reloadMisses += 1;
+      result.keyReloadMisses[key] += 1;
+    }
+  };
+  const auto recordEviction = [&](Result& result, int key) {
+    result.evictions += 1;
+    result.keyEvictions[key] += 1;
+  };
+  const auto finishAccess = [&](size_t index, const std::vector<int>& cache) {
+    if (continuousPhases == nullptr || phaseWindow <= 0) return;
+    const bool phaseEnded = (index + 1) % static_cast<size_t>(phaseWindow) == 0 || index + 1 == trace.size();
+    if (!phaseEnded) return;
+    phaseResult.finalCache = cache;
+    continuousPhases->push_back(phaseResult);
+    phaseResult = Result{};
+  };
+
   if (policy == Policy::OPT) {
     Result result;
     if (capacity <= 0) return result;
@@ -193,19 +234,15 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy)
       }
 
       if (cacheSet.find(key) != cacheSet.end()) {
-        result.hits += 1;
-        result.keyHits[key] += 1;
+        recordHit(result, key);
+        if (continuousPhases != nullptr) recordHit(phaseResult, key);
+        finishAccess(static_cast<size_t>(index), cache);
         continue;
       }
 
-      result.misses += 1;
-      if (seenKeys.insert(key).second) {
-        result.coldMisses += 1;
-        result.keyColdMisses[key] += 1;
-      } else {
-        result.reloadMisses += 1;
-        result.keyReloadMisses[key] += 1;
-      }
+      const bool isCold = seenKeys.insert(key).second;
+      recordMiss(result, key, isCold);
+      if (continuousPhases != nullptr) recordMiss(phaseResult, key, isCold);
 
       if (static_cast<int>(cache.size()) >= capacity) {
         size_t victimIndex = 0;
@@ -222,12 +259,13 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy)
         const int evictedKey = cache[victimIndex];
         cacheSet.erase(evictedKey);
         cache.erase(cache.begin() + static_cast<std::ptrdiff_t>(victimIndex));
-        result.evictions += 1;
-        result.keyEvictions[evictedKey] += 1;
+        recordEviction(result, evictedKey);
+        if (continuousPhases != nullptr) recordEviction(phaseResult, evictedKey);
       }
 
       cache.push_back(key);
       cacheSet.insert(key);
+      finishAccess(static_cast<size_t>(index), cache);
     }
 
     result.finalCache = cache;
@@ -242,11 +280,12 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy)
   std::unordered_map<int, int> positions;
   std::unordered_set<int> seenKeys;
 
-  for (int key : trace) {
+  for (size_t accessIndex = 0; accessIndex < trace.size(); ++accessIndex) {
+    const int key = trace[accessIndex];
     auto found = positions.find(key);
     if (found != positions.end()) {
-      result.hits += 1;
-      result.keyHits[key] += 1;
+      recordHit(result, key);
+      if (continuousPhases != nullptr) recordHit(phaseResult, key);
       if (policy == Policy::LRU) {
         const int index = found->second;
         const int value = cache[static_cast<size_t>(index)];
@@ -256,26 +295,23 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy)
           positions[cache[i]] = static_cast<int>(i);
         }
       }
+      finishAccess(accessIndex, cache);
       continue;
     }
 
-    result.misses += 1;
-    if (seenKeys.insert(key).second) {
-      result.coldMisses += 1;
-      result.keyColdMisses[key] += 1;
-    } else {
-      result.reloadMisses += 1;
-      result.keyReloadMisses[key] += 1;
-    }
+    const bool isCold = seenKeys.insert(key).second;
+    recordMiss(result, key, isCold);
+    if (continuousPhases != nullptr) recordMiss(phaseResult, key, isCold);
     if (static_cast<int>(cache.size()) >= capacity) {
       const int evictedKey = cache.front();
       positions.erase(evictedKey);
       cache.erase(cache.begin());
-      result.evictions += 1;
-      result.keyEvictions[evictedKey] += 1;
+      recordEviction(result, evictedKey);
+      if (continuousPhases != nullptr) recordEviction(phaseResult, evictedKey);
     }
     cache.push_back(key);
     positions[key] = static_cast<int>(cache.size() - 1);
+    finishAccess(accessIndex, cache);
   }
 
   result.finalCache = cache;
@@ -409,10 +445,12 @@ double hitRate(const Result& result, int totalAccesses) {
 
 const char* winnerLabel(const Result& fifoResult, const Result& lruResult, const Result& optResult);
 
-PhasePolicyCounts countPhasePolicyConclusions(const std::vector<PhaseSummary>& phases) {
+PhasePolicyCounts countPhasePolicyConclusions(const std::vector<PhaseSummary>& phases, bool continuous = false) {
   PhasePolicyCounts counts;
   for (const PhaseSummary& phase : phases) {
-    const int delta = lruHitDelta(phase.fifo, phase.lru);
+    const Result& fifo = continuous ? phase.continuousFifo : phase.fifo;
+    const Result& lru = continuous ? phase.continuousLru : phase.lru;
+    const int delta = lruHitDelta(fifo, lru);
     if (delta > 0) {
       counts.lruWins += 1;
     } else if (delta < 0) {
@@ -424,9 +462,30 @@ PhasePolicyCounts countPhasePolicyConclusions(const std::vector<PhaseSummary>& p
   return counts;
 }
 
+PhaseComparisonSummary summarizePhaseComparison(const std::vector<PhaseSummary>& phases) {
+  PhaseComparisonSummary summary;
+  summary.isolatedCounts = countPhasePolicyConclusions(phases);
+  summary.continuousCounts = countPhasePolicyConclusions(phases, true);
+  for (const PhaseSummary& phase : phases) {
+    summary.changedOnlineConclusions += std::string(onlinePolicyLabel(phase.fifo, phase.lru)) !=
+                                        onlinePolicyLabel(phase.continuousFifo, phase.continuousLru);
+    summary.fifoCarryHitDelta += phase.continuousFifo.hits - phase.fifo.hits;
+    summary.lruCarryHitDelta += phase.continuousLru.hits - phase.lru.hits;
+    summary.optCarryHitDelta += phase.continuousOpt.hits - phase.opt.hits;
+  }
+  return summary;
+}
+
 std::vector<PhaseSummary> buildPhaseSummaries(const std::vector<int>& trace, int capacity, int phaseWindow) {
   std::vector<PhaseSummary> phases;
   if (phaseWindow <= 0) return phases;
+
+  std::vector<Result> continuousFifo;
+  std::vector<Result> continuousLru;
+  std::vector<Result> continuousOpt;
+  runSimulation(trace, capacity, Policy::FIFO, phaseWindow, &continuousFifo);
+  runSimulation(trace, capacity, Policy::LRU, phaseWindow, &continuousLru);
+  runSimulation(trace, capacity, Policy::OPT, phaseWindow, &continuousOpt);
 
   int phaseIndex = 1;
   for (size_t start = 0; start < trace.size(); start += static_cast<size_t>(phaseWindow)) {
@@ -441,6 +500,10 @@ std::vector<PhaseSummary> buildPhaseSummaries(const std::vector<int>& trace, int
     summary.fifo = runSimulation(phaseTrace, capacity, Policy::FIFO);
     summary.lru = runSimulation(phaseTrace, capacity, Policy::LRU);
     summary.opt = runSimulation(phaseTrace, capacity, Policy::OPT);
+    const size_t continuousIndex = static_cast<size_t>(summary.phaseIndex - 1);
+    summary.continuousFifo = continuousFifo.at(continuousIndex);
+    summary.continuousLru = continuousLru.at(continuousIndex);
+    summary.continuousOpt = continuousOpt.at(continuousIndex);
     phases.push_back(summary);
   }
 
@@ -450,25 +513,28 @@ std::vector<PhaseSummary> buildPhaseSummaries(const std::vector<int>& trace, int
 void printPhaseSummary(const std::vector<PhaseSummary>& phases, int phaseCapacity) {
   if (phases.empty()) return;
 
-  const PhasePolicyCounts counts = countPhasePolicyConclusions(phases);
-  std::cout << "\nPhase-local summary (window " << (phases.front().endAccess - phases.front().startAccess + 1)
+  const PhaseComparisonSummary comparison = summarizePhaseComparison(phases);
+
+  std::cout << "\nPhase analysis (window " << (phases.front().endAccess - phases.front().startAccess + 1)
             << ", capacity " << phaseCapacity << ")\n";
-  std::cout << "Online conclusions: LRU led " << counts.lruWins << ", FIFO led " << counts.fifoWins
-            << ", tied " << counts.ties << ".\n";
-  std::cout << "Phase | Access range | Unique keys | Reuse rate | FIFO hit% | LRU hit% | OPT hit% | Online pick | LRU delta\n";
+  std::cout << "Isolated conclusions: LRU led " << comparison.isolatedCounts.lruWins << ", FIFO led "
+            << comparison.isolatedCounts.fifoWins << ", tied " << comparison.isolatedCounts.ties << ".\n";
+  std::cout << "Continuous conclusions: LRU led " << comparison.continuousCounts.lruWins << ", FIFO led "
+            << comparison.continuousCounts.fifoWins << ", tied " << comparison.continuousCounts.ties << ".\n";
+  std::cout << "Carry-over effect: FIFO " << std::showpos << comparison.fifoCarryHitDelta << " hit(s), LRU "
+            << comparison.lruCarryHitDelta << " hit(s) versus isolated resets; " << std::noshowpos
+            << comparison.changedOnlineConclusions
+            << " online conclusion(s) changed.\n";
+  std::cout << "Phase | Access range | Reset pick | Live pick | Reset LRU delta | Live LRU delta | FIFO carry | LRU carry\n";
   for (const PhaseSummary& phase : phases) {
-    const int accesses = phase.endAccess - phase.startAccess + 1;
-    const double reuseRate =
-        accesses > 0 ? static_cast<double>(phase.stats.repeatedAccesses) / static_cast<double>(accesses) : 0.0;
     std::cout << std::setw(5) << phase.phaseIndex << " | "
               << std::setw(3) << phase.startAccess << "-" << std::setw(3) << phase.endAccess << " | "
-              << std::setw(11) << phase.stats.uniqueKeys << " | "
-              << std::setw(9) << std::fixed << std::setprecision(2) << (reuseRate * 100.0) << "% | "
-              << std::setw(8) << (hitRate(phase.fifo, accesses) * 100.0) << "% | "
-              << std::setw(7) << (hitRate(phase.lru, accesses) * 100.0) << "% | "
-              << std::setw(7) << (hitRate(phase.opt, accesses) * 100.0) << "% | "
-              << std::setw(11) << onlinePolicyLabel(phase.fifo, phase.lru) << " | "
-              << std::setw(9) << lruHitDelta(phase.fifo, phase.lru) << "\n";
+              << std::setw(10) << onlinePolicyLabel(phase.fifo, phase.lru) << " | "
+              << std::setw(9) << onlinePolicyLabel(phase.continuousFifo, phase.continuousLru) << " | "
+              << std::setw(15) << lruHitDelta(phase.fifo, phase.lru) << " | "
+              << std::setw(14) << lruHitDelta(phase.continuousFifo, phase.continuousLru) << " | "
+              << std::setw(10) << std::showpos << (phase.continuousFifo.hits - phase.fifo.hits) << " | "
+              << std::setw(9) << (phase.continuousLru.hits - phase.lru.hits) << std::noshowpos << "\n";
   }
 }
 
@@ -615,26 +681,30 @@ void writeMarkdownReport(const std::string& path, const std::vector<int>& capaci
   }
 
   if (!phaseSummaries.empty()) {
-    const PhasePolicyCounts counts = countPhasePolicyConclusions(phaseSummaries);
-    out << "\n## Phase-local summary\n\n";
-    out << "Phase-local analysis resets the cache at each window so locality shifts are easier to compare.\n\n";
+    const PhaseComparisonSummary comparison = summarizePhaseComparison(phaseSummaries);
+    out << "\n## Phase analysis\n\n";
+    out << "The isolated view resets each window to compare locality regimes. The continuous view carries real cache "
+           "state across boundaries to expose warm-start gains or transition penalties.\n\n";
     out << "- Phase window: `" << (phaseSummaries.front().endAccess - phaseSummaries.front().startAccess + 1) << "` accesses\n";
-    out << "- Phase capacity: `" << phaseCapacity << "`\n\n";
-    out << "Online policy conclusions: LRU led `" << counts.lruWins << "` phase(s), FIFO led `"
-        << counts.fifoWins << "`, and `" << counts.ties << "` tied. OPT remains the offline ceiling.\n\n";
-    out << "| Phase | Access range | Unique keys | Reuse rate | FIFO hit % | LRU hit % | OPT hit % | Online pick | LRU hit delta |\n";
-    out << "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: |\n";
+    out << "- Phase capacity: `" << phaseCapacity << "`\n";
+    out << "- Isolated conclusions: LRU `" << comparison.isolatedCounts.lruWins << "`, FIFO `"
+        << comparison.isolatedCounts.fifoWins << "`, tie `" << comparison.isolatedCounts.ties << "`\n";
+    out << "- Continuous conclusions: LRU `" << comparison.continuousCounts.lruWins << "`, FIFO `"
+        << comparison.continuousCounts.fifoWins << "`, tie `" << comparison.continuousCounts.ties << "`\n";
+    out << "- Carry-over effect: FIFO `" << std::showpos << comparison.fifoCarryHitDelta << "` hit(s), LRU `"
+        << comparison.lruCarryHitDelta << "` hit(s) versus isolated resets; `" << std::noshowpos
+        << comparison.changedOnlineConclusions
+        << "` online conclusion(s) changed\n\n";
+    out << "| Phase | Access range | Isolated pick | Continuous pick | Isolated LRU delta | Continuous LRU delta | FIFO carry | LRU carry |\n";
+    out << "| --- | --- | --- | --- | ---: | ---: | ---: | ---: |\n";
     for (const PhaseSummary& phase : phaseSummaries) {
-      const int accesses = phase.endAccess - phase.startAccess + 1;
-      const double reuseRate =
-          accesses > 0 ? static_cast<double>(phase.stats.repeatedAccesses) / static_cast<double>(accesses) : 0.0;
       out << "| " << phase.phaseIndex << " | " << phase.startAccess << "-" << phase.endAccess << " | "
-          << phase.stats.uniqueKeys << " | " << std::fixed << std::setprecision(2) << (reuseRate * 100.0) << "% | "
-          << (hitRate(phase.fifo, accesses) * 100.0) << "% | "
-          << (hitRate(phase.lru, accesses) * 100.0) << "% | "
-          << (hitRate(phase.opt, accesses) * 100.0) << "% | "
           << onlinePolicyLabel(phase.fifo, phase.lru) << " | "
-          << lruHitDelta(phase.fifo, phase.lru) << " |\n";
+          << onlinePolicyLabel(phase.continuousFifo, phase.continuousLru) << " | "
+          << lruHitDelta(phase.fifo, phase.lru) << " | "
+          << lruHitDelta(phase.continuousFifo, phase.continuousLru) << " | "
+          << std::showpos << (phase.continuousFifo.hits - phase.fifo.hits) << " | "
+          << (phase.continuousLru.hits - phase.lru.hits) << std::noshowpos << " |\n";
     }
   }
 
@@ -760,12 +830,19 @@ void writeJsonReport(const std::string& path, const std::vector<int>& capacities
   out << "  ]";
 
   if (!phaseSummaries.empty()) {
-    const PhasePolicyCounts counts = countPhasePolicyConclusions(phaseSummaries);
+    const PhaseComparisonSummary comparison = summarizePhaseComparison(phaseSummaries);
     out << ",\n  \"phase_local\": {\n";
     out << "    \"capacity\": " << phaseCapacity << ",\n";
     out << "    \"window\": " << (phaseSummaries.front().endAccess - phaseSummaries.front().startAccess + 1) << ",\n";
-    out << "    \"policy_conclusions\": {\"lru\":" << counts.lruWins << ",\"fifo\":" << counts.fifoWins
-        << ",\"tie\":" << counts.ties << "},\n";
+    out << "    \"policy_conclusions\": {\"lru\":" << comparison.isolatedCounts.lruWins << ",\"fifo\":"
+        << comparison.isolatedCounts.fifoWins << ",\"tie\":" << comparison.isolatedCounts.ties << "},\n";
+    out << "    \"continuous_policy_conclusions\": {\"lru\":" << comparison.continuousCounts.lruWins
+        << ",\"fifo\":" << comparison.continuousCounts.fifoWins << ",\"tie\":"
+        << comparison.continuousCounts.ties << "},\n";
+    out << "    \"carry_effect\": {\"fifo_hit_delta\":" << comparison.fifoCarryHitDelta
+        << ",\"lru_hit_delta\":" << comparison.lruCarryHitDelta << ",\"opt_hit_delta\":"
+        << comparison.optCarryHitDelta << ",\"changed_online_conclusions\":"
+        << comparison.changedOnlineConclusions << "},\n";
     out << "    \"phases\": [\n";
     for (size_t i = 0; i < phaseSummaries.size(); ++i) {
       const PhaseSummary& phase = phaseSummaries[i];
@@ -787,6 +864,23 @@ void writeJsonReport(const std::string& path, const std::vector<int>& capacities
       writeResultObject(phase.lru, accesses);
       out << ",\n        \"opt\": ";
       writeResultObject(phase.opt, accesses);
+      out << ",\n        \"continuous\": {\n";
+      out << "          \"winner\": \"" << winnerLabel(phase.continuousFifo, phase.continuousLru, phase.continuousOpt)
+          << "\",\n";
+      out << "          \"online_choice\": \"" << onlinePolicyLabel(phase.continuousFifo, phase.continuousLru)
+          << "\",\n";
+      out << "          \"lru_hit_delta\": " << lruHitDelta(phase.continuousFifo, phase.continuousLru) << ",\n";
+      out << "          \"fifo\": ";
+      writeResultObject(phase.continuousFifo, accesses);
+      out << ",\n          \"lru\": ";
+      writeResultObject(phase.continuousLru, accesses);
+      out << ",\n          \"opt\": ";
+      writeResultObject(phase.continuousOpt, accesses);
+      out << "\n        },\n";
+      out << "        \"carry_effect\": {\"fifo_hit_delta\":"
+          << (phase.continuousFifo.hits - phase.fifo.hits) << ",\"lru_hit_delta\":"
+          << (phase.continuousLru.hits - phase.lru.hits) << ",\"opt_hit_delta\":"
+          << (phase.continuousOpt.hits - phase.opt.hits) << "}";
       out << "\n      }";
       if (i + 1 != phaseSummaries.size()) out << ",";
       out << "\n";
@@ -854,8 +948,33 @@ bool runSelfTest() {
   const PhasePolicyCounts conclusionCounts = countPhasePolicyConclusions(policyPhases);
   require(conclusionCounts.lruWins == 1 && conclusionCounts.fifoWins == 1 && conclusionCounts.ties == 1,
           "Phase conclusion aggregation should preserve one LRU win, one FIFO win, and one tie.");
+  const PhasePolicyCounts continuousConclusionCounts = countPhasePolicyConclusions(policyPhases, true);
+  require(continuousConclusionCounts.lruWins == 2 && continuousConclusionCounts.fifoWins == 0 &&
+              continuousConclusionCounts.ties == 1,
+          "Continuous phase conclusions should preserve two LRU wins and one tie.");
+  require(policyPhases[1].continuousFifo.hits - policyPhases[1].fifo.hits == 2 &&
+              policyPhases[1].continuousLru.hits - policyPhases[1].lru.hits == 4,
+          "The transition phase should quantify FIFO +2 and LRU +4 warm-state hits.");
+  require(std::string(onlinePolicyLabel(policyPhases[1].continuousFifo, policyPhases[1].continuousLru)) == "LRU",
+          "Carrying live state should reverse the isolated FIFO recommendation in phase two.");
+  require(policyPhases[1].continuousLru.coldMisses == 1 && policyPhases[1].continuousLru.reloadMisses == 5,
+          "Continuous miss classification should retain global seen-key history.");
+  const PhaseComparisonSummary comparison = summarizePhaseComparison(policyPhases);
+  require(comparison.fifoCarryHitDelta == 2 && comparison.lruCarryHitDelta == 4 &&
+              comparison.optCarryHitDelta == 3 && comparison.changedOnlineConclusions == 1,
+          "Aggregate carry-over effects should match the frozen three-phase contract.");
+  const Result fullFifo = runSimulation(multiPhaseTrace, 3, Policy::FIFO);
+  const Result fullLru = runSimulation(multiPhaseTrace, 3, Policy::LRU);
+  int continuousFifoHits = 0;
+  int continuousLruHits = 0;
+  for (const PhaseSummary& phase : policyPhases) {
+    continuousFifoHits += phase.continuousFifo.hits;
+    continuousLruHits += phase.continuousLru.hits;
+  }
+  require(continuousFifoHits == fullFifo.hits && continuousLruHits == fullLru.hits,
+          "Continuous phase hit totals should reconcile with the full-trace simulations.");
 
-  std::cout << "Self-test passed: parsing, simulation, key pressure, and multi-phase policy conclusions are stable.\n";
+  std::cout << "Self-test passed: parsing, simulation, key pressure, and isolated/continuous phase contracts are stable.\n";
   return true;
 }
 

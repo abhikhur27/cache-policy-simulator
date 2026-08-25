@@ -43,7 +43,7 @@ Write a JSON artifact for downstream analysis or automated checks:
 ./cache_policy_sim sample_trace.txt 2-6 --json-out reports/cache-sweep.json
 ```
 
-Inspect locality shifts across a long trace with phase-local windows:
+Inspect locality shifts and boundary effects across a long trace with phase windows:
 
 ```bash
 ./cache_policy_sim sample_trace.txt 2-6 --phase-window 6 --markdown-out reports/cache-sweep.md
@@ -55,7 +55,7 @@ Run the deterministic three-regime fixture to verify that policy advice changes 
 ./cache_policy_sim fixtures/multi_phase_trace.txt 3 --phase-window 12
 ```
 
-The fixture contains an LRU-favoring locality phase, a FIFO-favoring cyclic scan, and a hot set that fits entirely. The phase table reports the deployable online choice and LRU hit delta; OPT stays visible as an offline ceiling instead of being presented as the operational recommendation.
+The fixture contains an LRU-favoring locality phase, a FIFO-favoring cyclic scan, and a hot set that fits entirely. For every window, the phase table shows both an isolated run that starts empty and a continuous run that carries live cache state forward. In phase two, the isolated result favors FIFO by one hit while the production-like continuous run favors LRU by one; retained state contributes two FIFO hits and four LRU hits. OPT stays visible as an offline ceiling instead of being presented as the operational recommendation.
 
 Surface the specific keys driving reload churn and evictions:
 
@@ -73,7 +73,7 @@ Arguments:
 
 - `trace_file`: Text file with integer keys (space or comma separated)
 - `cache_capacity`: Positive integer cache size, ascending range, or comma-separated list
-- `--phase-window N`: Optional phase-local analysis window size in accesses. Uses the largest requested capacity.
+- `--phase-window N`: Optional phase analysis window size in accesses. Uses the largest requested capacity and reports isolated-reset and continuous-state results together.
 - `--top-keys N`: Optional number of per-policy hot/churn keys to include in console, Markdown, and JSON diagnostics.
 - `--json-out path`: Optional machine-readable report with sweep and phase-local metrics.
 - `--self-test`: Runs deterministic parser/simulation regression checks without a trace file.
@@ -93,9 +93,10 @@ Arguments:
 - Per-policy key pressure tables showing which keys drive reload misses and evictions
 - Capacity-sweep table showing where FIFO/LRU diverge as cache size grows
 - Belady anomaly check that flags when FIFO gets worse after adding capacity
-- Optional phase-local table that resets the cache per window so changing locality is easy to spot
-- FIFO-vs-LRU online choice and signed LRU hit delta for every capacity and phase, including CSV/Markdown/JSON exports
-- Phase conclusion counts showing how often LRU leads, FIFO leads, or both tie
+- Optional phase table that compares isolated-reset results with continuous cache state
+- Per-phase carry-over deltas showing warm-start gains or transition penalties for FIFO, LRU, and OPT
+- FIFO-vs-LRU online choice and signed LRU hit delta for every capacity and phase in console, Markdown, and JSON output
+- Isolated and continuous conclusion counts showing how often LRU leads, FIFO leads, or both tie
 - Optional CSV export with one row per policy/capacity pair
 - Optional Markdown brief with sweep, phase-local, and per-capacity policy details
 - Optional JSON export with sweep metrics, final-cache state, and phase-local results
@@ -112,7 +113,7 @@ zig c++ -std=c++17 -O2 -Wall -Wextra -pedantic cache_policy_sim.cpp -o cache_pol
 ./cache_policy_sim fixtures/multi_phase_trace.txt 3 --phase-window 12 --top-keys 6 --markdown-out reports/cache-sweep.md --json-out reports/cache-sweep.json
 ```
 
-That run should pass the self-test and show one LRU phase, one FIFO phase, and one tie while exporting the same conclusions to Markdown and JSON.
+That run should pass the self-test and show the isolated LRU/FIFO/tie split. The continuous view should change phase two from FIFO to LRU, yielding two LRU phases and one tie, with aggregate carry-over gains of two FIFO hits and four LRU hits.
 
 ## Portfolio Demo Script
 

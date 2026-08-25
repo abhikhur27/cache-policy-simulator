@@ -23,6 +23,20 @@ jobs:
           report = json.loads(Path("reports/multi-phase.json").read_text())
           phase_local = report["phase_local"]
           assert phase_local["policy_conclusions"] == {"lru": 1, "fifo": 1, "tie": 1}
+          assert phase_local["continuous_policy_conclusions"] == {"lru": 2, "fifo": 0, "tie": 1}
+          assert phase_local["carry_effect"] == {
+              "fifo_hit_delta": 2,
+              "lru_hit_delta": 4,
+              "opt_hit_delta": 3,
+              "changed_online_conclusions": 1,
+          }
           assert [phase["online_choice"] for phase in phase_local["phases"]] == ["LRU", "FIFO", "TIE"]
           assert [phase["lru_hit_delta"] for phase in phase_local["phases"]] == [1, -1, 0]
+          assert [phase["continuous"]["online_choice"] for phase in phase_local["phases"]] == ["LRU", "LRU", "TIE"]
+          assert [phase["continuous"]["lru_hit_delta"] for phase in phase_local["phases"]] == [1, 1, 0]
+          assert phase_local["phases"][1]["carry_effect"] == {
+              "fifo_hit_delta": 2,
+              "lru_hit_delta": 4,
+              "opt_hit_delta": 3,
+          }
           PY
