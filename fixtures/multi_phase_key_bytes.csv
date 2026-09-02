@@ -1,0 +1,9 @@
+# key,bytes -- metadata/object/blob size skew for the three-regime trace
+1,4096
+2,16384
+3,1048576
+4,8388608
+5,67108864
+7,65536
+8,131072
+9,262144

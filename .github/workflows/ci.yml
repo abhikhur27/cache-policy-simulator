@@ -8,14 +8,18 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build with warnings enabled
         run: g++ -std=c++17 -O2 -Wall -Wextra -pedantic cache_policy_sim.cpp -o cache_policy_sim
       - name: Run simulation regressions
         run: ./cache_policy_sim --self-test
       - name: Verify multi-phase policy contract
         run: |
-          ./cache_policy_sim fixtures/multi_phase_trace.txt 3 --phase-window 12 --json-out reports/multi-phase.json
+          ./cache_policy_sim fixtures/multi_phase_trace.txt 3 \
+            --phase-window 12 \
+            --phase-warmup 3 \
+            --key-bytes fixtures/multi_phase_key_bytes.csv \
+            --json-out reports/multi-phase.json
           python3 - <<'PY'
           import json
           from pathlib import Path
@@ -39,4 +43,14 @@ jobs:
               "lru_hit_delta": 4,
               "opt_hit_delta": 3,
           }
+          sweep = report["capacity_sweep"][0]
+          assert report["trace"]["byte_weighted"] is True
+          assert sweep["online_choice"] == "LRU"
+          assert sweep["byte_choice"] == "FIFO"
+          assert sweep["lru_miss_byte_savings"] == -58_699_776
+          transitions = [phase["transition"] for phase in phase_local["phases"]]
+          assert [phase["steady_byte_choice"] for phase in transitions] == ["LRU", "FIFO", "TIE"]
+          assert transitions[1]["warmup"]["fifo"]["miss_bytes"] == 1_048_576
+          assert transitions[1]["steady_state"]["fifo"]["miss_bytes"] == 84_955_136
+          assert transitions[1]["steady_state"]["lru"]["miss_bytes"] == 143_659_008
           PY
