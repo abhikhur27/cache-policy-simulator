@@ -27,30 +27,30 @@ jobs:
           report = json.loads(Path("reports/multi-phase.json").read_text())
           phase_local = report["phase_local"]
           assert phase_local["policy_conclusions"] == {"lru": 1, "fifo": 1, "tie": 1}
-          assert phase_local["continuous_policy_conclusions"] == {"lru": 2, "fifo": 0, "tie": 1}
+          assert phase_local["continuous_policy_conclusions"] == {"lru": 1, "fifo": 1, "tie": 1}
           assert phase_local["carry_effect"] == {
               "fifo_hit_delta": 2,
-              "lru_hit_delta": 4,
+              "lru_hit_delta": 2,
               "opt_hit_delta": 3,
-              "changed_online_conclusions": 1,
+              "changed_online_conclusions": 0,
           }
           assert [phase["online_choice"] for phase in phase_local["phases"]] == ["LRU", "FIFO", "TIE"]
-          assert [phase["lru_hit_delta"] for phase in phase_local["phases"]] == [1, -1, 0]
-          assert [phase["continuous"]["online_choice"] for phase in phase_local["phases"]] == ["LRU", "LRU", "TIE"]
-          assert [phase["continuous"]["lru_hit_delta"] for phase in phase_local["phases"]] == [1, 1, 0]
+          assert [phase["lru_hit_delta"] for phase in phase_local["phases"]] == [2, -1, 0]
+          assert [phase["continuous"]["online_choice"] for phase in phase_local["phases"]] == ["LRU", "FIFO", "TIE"]
+          assert [phase["continuous"]["lru_hit_delta"] for phase in phase_local["phases"]] == [2, -1, 0]
           assert phase_local["phases"][1]["carry_effect"] == {
               "fifo_hit_delta": 2,
-              "lru_hit_delta": 4,
+              "lru_hit_delta": 2,
               "opt_hit_delta": 3,
           }
           sweep = report["capacity_sweep"][0]
           assert report["trace"]["byte_weighted"] is True
           assert sweep["online_choice"] == "LRU"
           assert sweep["byte_choice"] == "FIFO"
-          assert sweep["lru_miss_byte_savings"] == -58_699_776
+          assert sweep["lru_miss_byte_savings"] == -67_100_672
           transitions = [phase["transition"] for phase in phase_local["phases"]]
           assert [phase["steady_byte_choice"] for phase in transitions] == ["LRU", "FIFO", "TIE"]
           assert transitions[1]["warmup"]["fifo"]["miss_bytes"] == 1_048_576
           assert transitions[1]["steady_state"]["fifo"]["miss_bytes"] == 84_955_136
-          assert transitions[1]["steady_state"]["lru"]["miss_bytes"] == 143_659_008
+          assert transitions[1]["steady_state"]["lru"]["miss_bytes"] == 152_064_000
           PY

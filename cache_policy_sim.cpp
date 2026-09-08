@@ -370,6 +370,12 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy,
   cache.reserve(static_cast<size_t>(capacity));
   std::unordered_map<int, int> positions;
   std::unordered_set<int> seenKeys;
+  const auto rebuildPositions = [&]() {
+    positions.clear();
+    for (size_t index = 0; index < cache.size(); ++index) {
+      positions[cache[index]] = static_cast<int>(index);
+    }
+  };
 
   for (size_t accessIndex = 0; accessIndex < trace.size(); ++accessIndex) {
     const int key = trace[accessIndex];
@@ -383,9 +389,7 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy,
         const int value = cache[static_cast<size_t>(index)];
         cache.erase(cache.begin() + index);
         cache.push_back(value);
-        for (size_t i = 0; i < cache.size(); ++i) {
-          positions[cache[i]] = static_cast<int>(i);
-        }
+        rebuildPositions();
       }
       finishAccess(accessIndex, cache);
       continue;
@@ -399,6 +403,7 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy,
       const int evictedKey = cache.front();
       positions.erase(evictedKey);
       cache.erase(cache.begin());
+      rebuildPositions();
       recordEviction(result, evictedKey);
       if (continuousPhases != nullptr) recordEviction(phaseResult, evictedKey);
       if (Result* segment = segmentAt(accessIndex)) recordEviction(*segment, evictedKey);
@@ -406,6 +411,54 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy,
     cache.push_back(key);
     positions[key] = static_cast<int>(cache.size() - 1);
     finishAccess(accessIndex, cache);
+  }
+
+  result.finalCache = cache;
+  return result;
+}
+
+Result runReferenceOnlineSimulation(const std::vector<int>& trace, int capacity, Policy policy,
+                                    const KeyBytes& keyBytes = {}) {
+  if (policy == Policy::OPT) {
+    throw std::invalid_argument("Reference simulation supports FIFO and LRU only.");
+  }
+
+  Result result;
+  if (capacity <= 0) return result;
+
+  std::vector<int> cache;
+  std::unordered_set<int> seenKeys;
+  for (int key : trace) {
+    const auto found = std::find(cache.begin(), cache.end(), key);
+    if (found != cache.end()) {
+      result.hits += 1;
+      result.keyHits[key] += 1;
+      if (policy == Policy::LRU) {
+        cache.erase(found);
+        cache.push_back(key);
+      }
+      continue;
+    }
+
+    result.misses += 1;
+    const long long bytes = bytesForKey(keyBytes, key);
+    result.missBytes += bytes;
+    result.keyMissBytes[key] += bytes;
+    if (seenKeys.insert(key).second) {
+      result.coldMisses += 1;
+      result.keyColdMisses[key] += 1;
+    } else {
+      result.reloadMisses += 1;
+      result.keyReloadMisses[key] += 1;
+    }
+
+    if (static_cast<int>(cache.size()) >= capacity) {
+      const int evictedKey = cache.front();
+      cache.erase(cache.begin());
+      result.evictions += 1;
+      result.keyEvictions[evictedKey] += 1;
+    }
+    cache.push_back(key);
   }
 
   result.finalCache = cache;
@@ -1222,8 +1275,42 @@ bool runSelfTest() {
   require(lruResult.coldMisses == 3 && lruResult.reloadMisses == 1, "LRU miss classification changed unexpectedly.");
   require(mapValueOrZero(lruResult.keyHits, 1) == 2 && mapValueOrZero(lruResult.keyReloadMisses, 2) == 1,
           "Per-key hit/reload accounting changed unexpectedly.");
-  require(mapValueOrZero(lruResult.keyEvictions, 2) == 1 && mapValueOrZero(lruResult.keyEvictions, 1) == 1,
-          "Per-key eviction accounting changed unexpectedly.");
+  require(mapValueOrZero(lruResult.keyEvictions, 2) == 1 && mapValueOrZero(lruResult.keyEvictions, 3) == 1 &&
+              mapValueOrZero(lruResult.keyEvictions, 1) == 0 &&
+              lruResult.finalCache == std::vector<int>({1, 2}),
+          "LRU recency order must remain correct after an eviction shifts cache positions.");
+
+  const auto requireOnlineParity = [&](const std::vector<int>& parityTrace, int capacity, Policy policy,
+                                       const KeyBytes& parityBytes, const std::string& label) {
+    const Result production = runSimulation(parityTrace, capacity, policy, 0, nullptr, parityBytes);
+    const Result reference = runReferenceOnlineSimulation(parityTrace, capacity, policy, parityBytes);
+    require(production.hits == reference.hits && production.misses == reference.misses &&
+                production.coldMisses == reference.coldMisses &&
+                production.reloadMisses == reference.reloadMisses && production.evictions == reference.evictions &&
+                production.missBytes == reference.missBytes && production.finalCache == reference.finalCache &&
+                production.keyHits == reference.keyHits && production.keyColdMisses == reference.keyColdMisses &&
+                production.keyReloadMisses == reference.keyReloadMisses &&
+                production.keyEvictions == reference.keyEvictions &&
+                production.keyMissBytes == reference.keyMissBytes,
+            "Optimized " + label + " simulation diverged from the independent reference model.");
+  };
+
+  std::vector<int> parityTrace;
+  unsigned int parityState = 0xC0FFEEU;
+  for (int index = 0; index < 256; ++index) {
+    parityState = parityState * 1664525U + 1013904223U;
+    parityTrace.push_back(1 + static_cast<int>((parityState >> 16U) % 9U));
+  }
+  const KeyBytes parityBytes = {
+      {1, 1024}, {2, 2048}, {3, 4096}, {4, 8192}, {5, 16384},
+      {6, 32768}, {7, 65536}, {8, 131072}, {9, 262144},
+  };
+  for (int capacity = 1; capacity <= 8; ++capacity) {
+    requireOnlineParity(parityTrace, capacity, Policy::FIFO, parityBytes,
+                        "FIFO capacity " + std::to_string(capacity));
+    requireOnlineParity(parityTrace, capacity, Policy::LRU, parityBytes,
+                        "LRU capacity " + std::to_string(capacity));
+  }
 
   const std::vector<int> anomalyTrace = {1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5};
   const Result fifoThree = runSimulation(anomalyTrace, 3, Policy::FIFO);
@@ -1244,9 +1331,9 @@ bool runSelfTest() {
   };
   const std::vector<PhaseSummary> policyPhases = buildPhaseSummaries(multiPhaseTrace, 3, 12);
   require(policyPhases.size() == 3, "Multi-phase fixture should produce exactly three policy windows.");
-  require(lruHitDelta(policyPhases[0].fifo, policyPhases[0].lru) == 1 &&
+  require(lruHitDelta(policyPhases[0].fifo, policyPhases[0].lru) == 2 &&
               std::string(onlinePolicyLabel(policyPhases[0].fifo, policyPhases[0].lru)) == "LRU",
-          "The locality phase should recommend LRU by one hit.");
+          "The locality phase should recommend LRU by two hits.");
   require(lruHitDelta(policyPhases[1].fifo, policyPhases[1].lru) == -1 &&
               std::string(onlinePolicyLabel(policyPhases[1].fifo, policyPhases[1].lru)) == "FIFO",
           "The cyclic scan phase should recommend FIFO by one hit.");
@@ -1257,19 +1344,19 @@ bool runSelfTest() {
   require(conclusionCounts.lruWins == 1 && conclusionCounts.fifoWins == 1 && conclusionCounts.ties == 1,
           "Phase conclusion aggregation should preserve one LRU win, one FIFO win, and one tie.");
   const PhasePolicyCounts continuousConclusionCounts = countPhasePolicyConclusions(policyPhases, true);
-  require(continuousConclusionCounts.lruWins == 2 && continuousConclusionCounts.fifoWins == 0 &&
+  require(continuousConclusionCounts.lruWins == 1 && continuousConclusionCounts.fifoWins == 1 &&
               continuousConclusionCounts.ties == 1,
-          "Continuous phase conclusions should preserve two LRU wins and one tie.");
+          "Continuous phase conclusions should preserve one LRU win, one FIFO win, and one tie.");
   require(policyPhases[1].continuousFifo.hits - policyPhases[1].fifo.hits == 2 &&
-              policyPhases[1].continuousLru.hits - policyPhases[1].lru.hits == 4,
-          "The transition phase should quantify FIFO +2 and LRU +4 warm-state hits.");
-  require(std::string(onlinePolicyLabel(policyPhases[1].continuousFifo, policyPhases[1].continuousLru)) == "LRU",
-          "Carrying live state should reverse the isolated FIFO recommendation in phase two.");
-  require(policyPhases[1].continuousLru.coldMisses == 1 && policyPhases[1].continuousLru.reloadMisses == 5,
+              policyPhases[1].continuousLru.hits - policyPhases[1].lru.hits == 2,
+          "The transition phase should quantify two warm-state hits for both online policies.");
+  require(std::string(onlinePolicyLabel(policyPhases[1].continuousFifo, policyPhases[1].continuousLru)) == "FIFO",
+          "Carrying live state should preserve the phase-two FIFO recommendation.");
+  require(policyPhases[1].continuousLru.coldMisses == 1 && policyPhases[1].continuousLru.reloadMisses == 7,
           "Continuous miss classification should retain global seen-key history.");
   const PhaseComparisonSummary comparison = summarizePhaseComparison(policyPhases);
-  require(comparison.fifoCarryHitDelta == 2 && comparison.lruCarryHitDelta == 4 &&
-              comparison.optCarryHitDelta == 3 && comparison.changedOnlineConclusions == 1,
+  require(comparison.fifoCarryHitDelta == 2 && comparison.lruCarryHitDelta == 2 &&
+              comparison.optCarryHitDelta == 3 && comparison.changedOnlineConclusions == 0,
           "Aggregate carry-over effects should match the frozen three-phase contract.");
   const Result fullFifo = runSimulation(multiPhaseTrace, 3, Policy::FIFO);
   const Result fullLru = runSimulation(multiPhaseTrace, 3, Policy::LRU);
@@ -1288,7 +1375,7 @@ bool runSelfTest() {
   };
   const Result weightedFifo = runSimulation(multiPhaseTrace, 3, Policy::FIFO, 0, nullptr, weightedBytes);
   const Result weightedLru = runSimulation(multiPhaseTrace, 3, Policy::LRU, 0, nullptr, weightedBytes);
-  require(weightedFifo.missBytes == 105398272 && weightedLru.missBytes == 164098048,
+  require(weightedFifo.missBytes == 105398272 && weightedLru.missBytes == 172498944,
           "Byte-weighted miss totals should match the skewed-object fixture.");
   require(std::string(onlinePolicyLabel(weightedFifo, weightedLru)) == "LRU" &&
               std::string(bytePolicyLabel(weightedFifo, weightedLru)) == "FIFO",
@@ -1298,14 +1385,15 @@ bool runSelfTest() {
   const PhaseComparisonSummary weightedComparison = summarizePhaseComparison(weightedPhases);
   require(weightedPhases[1].warmupFifo.missBytes == 1048576 &&
               weightedPhases[1].steadyFifo.missBytes == 84955136 &&
-              weightedPhases[1].steadyLru.missBytes == 143659008,
+              weightedPhases[1].steadyLru.missBytes == 152064000,
           "Warm-up and steady-state miss volume should stay frozen across the working-set shift.");
   require(weightedComparison.steadyByteCounts.lruWins == 1 &&
               weightedComparison.steadyByteCounts.fifoWins == 1 &&
               weightedComparison.steadyByteCounts.ties == 1,
           "Steady-state byte recommendations should cover one LRU, one FIFO, and one tie phase.");
 
-  std::cout << "Self-test passed: parsing, simulation, byte-weighted cost, and phase-transition contracts are stable.\n";
+  std::cout << "Self-test passed: optimized online policies match the reference model; parsing, byte-weighted cost, "
+               "and phase-transition contracts are stable.\n";
   return true;
 }
 
