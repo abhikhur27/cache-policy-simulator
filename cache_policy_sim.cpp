@@ -3,6 +3,8 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
+#include <list>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -274,20 +276,20 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy,
     result.evictions += 1;
     result.keyEvictions[key] += 1;
   };
-  const auto finishAccess = [&](size_t index, const std::vector<int>& cache) {
+  const auto finishAccess = [&](size_t index, const auto& cache) {
     if (continuousPhases == nullptr || phaseWindow <= 0) return;
     if (warmupPhases != nullptr && steadyPhases != nullptr && phaseWarmup > 0 &&
         static_cast<int>(index % static_cast<size_t>(phaseWindow)) + 1 == phaseWarmup) {
-      warmupResult.finalCache = cache;
+      warmupResult.finalCache.assign(cache.begin(), cache.end());
     }
     const bool phaseEnded = (index + 1) % static_cast<size_t>(phaseWindow) == 0 || index + 1 == trace.size();
     if (!phaseEnded) return;
-    phaseResult.finalCache = cache;
+    phaseResult.finalCache.assign(cache.begin(), cache.end());
     continuousPhases->push_back(phaseResult);
     phaseResult = Result{};
     if (warmupPhases != nullptr && steadyPhases != nullptr && phaseWarmup > 0) {
-      if (warmupResult.finalCache.empty()) warmupResult.finalCache = cache;
-      steadyResult.finalCache = cache;
+      if (warmupResult.finalCache.empty()) warmupResult.finalCache.assign(cache.begin(), cache.end());
+      steadyResult.finalCache.assign(cache.begin(), cache.end());
       warmupPhases->push_back(warmupResult);
       steadyPhases->push_back(steadyResult);
       warmupResult = Result{};
@@ -366,16 +368,9 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy,
   Result result;
   if (capacity <= 0) return result;
 
-  std::vector<int> cache;
-  cache.reserve(static_cast<size_t>(capacity));
-  std::unordered_map<int, int> positions;
+  std::list<int> cache;
+  std::unordered_map<int, std::list<int>::iterator> positions;
   std::unordered_set<int> seenKeys;
-  const auto rebuildPositions = [&]() {
-    positions.clear();
-    for (size_t index = 0; index < cache.size(); ++index) {
-      positions[cache[index]] = static_cast<int>(index);
-    }
-  };
 
   for (size_t accessIndex = 0; accessIndex < trace.size(); ++accessIndex) {
     const int key = trace[accessIndex];
@@ -385,11 +380,8 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy,
       if (continuousPhases != nullptr) recordHit(phaseResult, key);
       if (Result* segment = segmentAt(accessIndex)) recordHit(*segment, key);
       if (policy == Policy::LRU) {
-        const int index = found->second;
-        const int value = cache[static_cast<size_t>(index)];
-        cache.erase(cache.begin() + index);
-        cache.push_back(value);
-        rebuildPositions();
+        cache.splice(cache.end(), cache, found->second);
+        found->second = std::prev(cache.end());
       }
       finishAccess(accessIndex, cache);
       continue;
@@ -402,18 +394,17 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy,
     if (static_cast<int>(cache.size()) >= capacity) {
       const int evictedKey = cache.front();
       positions.erase(evictedKey);
-      cache.erase(cache.begin());
-      rebuildPositions();
+      cache.pop_front();
       recordEviction(result, evictedKey);
       if (continuousPhases != nullptr) recordEviction(phaseResult, evictedKey);
       if (Result* segment = segmentAt(accessIndex)) recordEviction(*segment, evictedKey);
     }
     cache.push_back(key);
-    positions[key] = static_cast<int>(cache.size() - 1);
+    positions[key] = std::prev(cache.end());
     finishAccess(accessIndex, cache);
   }
 
-  result.finalCache = cache;
+  result.finalCache.assign(cache.begin(), cache.end());
   return result;
 }
 
@@ -1280,6 +1271,7 @@ bool runSelfTest() {
               lruResult.finalCache == std::vector<int>({1, 2}),
           "LRU recency order must remain correct after an eviction shifts cache positions.");
 
+  int onlineParityChecks = 0;
   const auto requireOnlineParity = [&](const std::vector<int>& parityTrace, int capacity, Policy policy,
                                        const KeyBytes& parityBytes, const std::string& label) {
     const Result production = runSimulation(parityTrace, capacity, policy, 0, nullptr, parityBytes);
@@ -1293,6 +1285,7 @@ bool runSelfTest() {
                 production.keyEvictions == reference.keyEvictions &&
                 production.keyMissBytes == reference.keyMissBytes,
             "Optimized " + label + " simulation diverged from the independent reference model.");
+    onlineParityChecks += 1;
   };
 
   std::vector<int> parityTrace;
@@ -1311,6 +1304,70 @@ bool runSelfTest() {
     requireOnlineParity(parityTrace, capacity, Policy::LRU, parityBytes,
                         "LRU capacity " + std::to_string(capacity));
   }
+
+  for (unsigned int seed = 1; seed <= 64; ++seed) {
+    unsigned int state = 0x9E3779B9U ^ (seed * 0x85EBCA6BU);
+    const int keyCount = 2 + static_cast<int>(seed % 31U);
+    const int traceLength = 128 + static_cast<int>((seed * 37U) % 385U);
+    const int hotKeyCount = std::max(1, keyCount / 4);
+    std::vector<int> generatedTrace;
+    generatedTrace.reserve(static_cast<size_t>(traceLength));
+    KeyBytes generatedBytes;
+    for (int key = 1; key <= keyCount; ++key) {
+      generatedBytes[key] = (1LL << (key % 18)) + static_cast<long long>(key) * 257LL;
+    }
+
+    for (int index = 0; index < traceLength; ++index) {
+      state = state * 1664525U + 1013904223U;
+      const int regime = (index / 32 + static_cast<int>(seed)) % 4;
+      int key = 0;
+      if (regime == 0) {
+        key = 1 + static_cast<int>((state >> 16U) % static_cast<unsigned int>(hotKeyCount));
+      } else if (regime == 1) {
+        key = 1 + (index * 5 + static_cast<int>(seed)) % keyCount;
+      } else if (regime == 2) {
+        key = 1 + static_cast<int>((state >> 16U) % static_cast<unsigned int>(keyCount));
+      } else {
+        const int burstLength = 1 + static_cast<int>(seed % 5U);
+        key = 1 + (index / burstLength + static_cast<int>(seed)) % keyCount;
+      }
+      generatedTrace.push_back(key);
+    }
+
+    std::vector<int> generatedCapacities = {
+        1,
+        std::max(1, keyCount / 4),
+        std::max(1, keyCount / 2),
+        std::max(1, keyCount - 1),
+        keyCount,
+        keyCount + 3,
+    };
+    std::sort(generatedCapacities.begin(), generatedCapacities.end());
+    generatedCapacities.erase(std::unique(generatedCapacities.begin(), generatedCapacities.end()),
+                              generatedCapacities.end());
+    for (int capacity : generatedCapacities) {
+      const std::string caseLabel = "seed " + std::to_string(seed) + ", capacity " + std::to_string(capacity);
+      requireOnlineParity(generatedTrace, capacity, Policy::FIFO, generatedBytes, "FIFO " + caseLabel);
+      requireOnlineParity(generatedTrace, capacity, Policy::LRU, generatedBytes, "LRU " + caseLabel);
+    }
+  }
+  require(onlineParityChecks == 742,
+          "The deterministic multi-seed parity corpus should exercise exactly 742 policy/capacity cases.");
+
+  constexpr int largeCapacity = 10000;
+  std::vector<int> largeRecencyTrace;
+  largeRecencyTrace.reserve(static_cast<size_t>(largeCapacity * 5 + 1));
+  for (int key = 1; key <= largeCapacity; ++key) largeRecencyTrace.push_back(key);
+  for (int pass = 0; pass < 4; ++pass) {
+    for (int key = 1; key <= largeCapacity; ++key) largeRecencyTrace.push_back(key);
+  }
+  largeRecencyTrace.push_back(largeCapacity + 1);
+  const Result largeLruResult = runSimulation(largeRecencyTrace, largeCapacity, Policy::LRU);
+  require(largeLruResult.misses == largeCapacity + 1 && largeLruResult.hits == largeCapacity * 4 &&
+              largeLruResult.evictions == 1 &&
+              largeLruResult.finalCache.size() == static_cast<size_t>(largeCapacity) &&
+              largeLruResult.finalCache.front() == 2 && largeLruResult.finalCache.back() == largeCapacity + 1,
+          "Large-capacity LRU recency updates should preserve exact eviction order.");
 
   const std::vector<int> anomalyTrace = {1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5};
   const Result fifoThree = runSimulation(anomalyTrace, 3, Policy::FIFO);
@@ -1392,8 +1449,10 @@ bool runSelfTest() {
               weightedComparison.steadyByteCounts.ties == 1,
           "Steady-state byte recommendations should cover one LRU, one FIFO, and one tie phase.");
 
-  std::cout << "Self-test passed: optimized online policies match the reference model; parsing, byte-weighted cost, "
-               "and phase-transition contracts are stable.\n";
+  std::cout << "Self-test passed: optimized online policies match the reference model across "
+            << onlineParityChecks
+            << " deterministic policy/capacity cases; large-cache recency, parsing, byte-weighted cost, and "
+               "phase-transition contracts are stable.\n";
   return true;
 }
 

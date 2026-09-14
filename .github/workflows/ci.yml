@@ -7,10 +7,14 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++, clang++]
     steps:
       - uses: actions/checkout@v7
       - name: Build with warnings enabled
-        run: g++ -std=c++17 -O2 -Wall -Wextra -pedantic cache_policy_sim.cpp -o cache_policy_sim
+        run: ${{ matrix.compiler }} -std=c++17 -O2 -Wall -Wextra -pedantic cache_policy_sim.cpp -o cache_policy_sim
       - name: Run simulation regressions
         run: ./cache_policy_sim --self-test
       - name: Verify multi-phase policy contract

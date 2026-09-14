@@ -86,6 +86,11 @@ Run the built-in regression checks:
 ./cache_policy_sim --self-test
 ```
 
+The self-test cross-checks the production FIFO/LRU engine against a deliberately simple linear reference across
+64 deterministic mixed-regime traces, varied capacities, and byte weights (742 policy/capacity cases total). It
+also exercises a 10,000-entry LRU working set so recency refreshes and eviction order stay correct at a size where
+vector-wide position rebuilds would be impractical.
+
 Arguments:
 
 - `trace_file`: Text file with integer keys (space or comma separated)
@@ -95,7 +100,7 @@ Arguments:
 - `--key-bytes path`: Optional key-to-byte mapping used to calculate total and per-key refill volume. Every trace key must be mapped.
 - `--top-keys N`: Optional number of per-policy hot/churn keys to include in console, Markdown, and JSON diagnostics.
 - `--json-out path`: Optional machine-readable report with sweep and phase-local metrics.
-- `--self-test`: Runs deterministic parser/simulation regressions and cross-checks the optimized FIFO/LRU engine against an independent linear reference model across eight capacities.
+- `--self-test`: Runs deterministic parser/simulation regressions and cross-checks the optimized FIFO/LRU engine against an independent linear reference model across hundreds of generated policy/capacity cases.
 
 ## Output
 
@@ -121,6 +126,11 @@ Arguments:
 - Optional CSV export with one row per policy/capacity pair
 - Optional Markdown brief with sweep, phase-local, and per-capacity policy details
 - Optional JSON export with sweep metrics, final-cache state, and phase-local results
+
+FIFO and LRU keep eviction order in a linked list with hash-indexed entries. Cache hits, recency refreshes, and
+online evictions therefore use average constant-time bookkeeping instead of rebuilding a position map across the
+entire cache. The intentionally linear reference implementation remains test-only so it can catch mistakes in the
+optimized path without sharing its data structure.
 
 ## Example workload
 
