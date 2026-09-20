@@ -36,6 +36,15 @@ struct Result {
 
 using KeyBytes = std::unordered_map<int, long long>;
 
+struct OptDiagnostics {
+  size_t nextUseSlots = 0;
+  size_t preprocessingKeys = 0;
+  size_t peakCacheEntries = 0;
+  size_t peakResidentStateEntries = 0;
+  size_t peakAuxiliarySlots = 0;
+  long long victimCandidateScans = 0;
+};
+
 struct TraceStats {
   int uniqueKeys = 0;
   int repeatedAccesses = 0;
@@ -248,10 +257,30 @@ long long bytesForKey(const KeyBytes& keyBytes, int key) {
   return found->second;
 }
 
+std::vector<int> buildNextUseTable(const std::vector<int>& trace, OptDiagnostics* diagnostics = nullptr) {
+  const int noFutureUse = std::numeric_limits<int>::max();
+  std::vector<int> nextUse(trace.size(), noFutureUse);
+  std::unordered_map<int, int> nearestUse;
+  for (size_t offset = trace.size(); offset > 0; --offset) {
+    const size_t index = offset - 1;
+    const int key = trace[index];
+    const auto found = nearestUse.find(key);
+    if (found != nearestUse.end()) nextUse[index] = found->second;
+    nearestUse[key] = static_cast<int>(index);
+  }
+
+  if (diagnostics != nullptr) {
+    diagnostics->nextUseSlots = nextUse.size();
+    diagnostics->preprocessingKeys = nearestUse.size();
+    diagnostics->peakAuxiliarySlots = nextUse.size() + nearestUse.size();
+  }
+  return nextUse;
+}
+
 Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy, int phaseWindow = 0,
                      std::vector<Result>* continuousPhases = nullptr, const KeyBytes& keyBytes = {},
                      int phaseWarmup = 0, std::vector<Result>* warmupPhases = nullptr,
-                     std::vector<Result>* steadyPhases = nullptr) {
+                     std::vector<Result>* steadyPhases = nullptr, OptDiagnostics* optDiagnostics = nullptr) {
   Result phaseResult;
   Result warmupResult;
   Result steadyResult;
@@ -306,27 +335,33 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy,
     Result result;
     if (capacity <= 0) return result;
 
-    std::unordered_map<int, std::vector<int>> futureAccesses;
-    for (int index = 0; index < static_cast<int>(trace.size()); ++index) {
-      futureAccesses[trace[static_cast<size_t>(index)]].push_back(index);
-    }
+    const std::vector<int> nextUse = buildNextUseTable(trace, optDiagnostics);
 
     std::vector<int> cache;
     cache.reserve(static_cast<size_t>(capacity));
     std::unordered_set<int> cacheSet;
+    std::unordered_map<int, int> residentNextUses;
     std::unordered_set<int> seenKeys;
+    const auto recordOptFootprint = [&]() {
+      if (optDiagnostics == nullptr) return;
+      optDiagnostics->peakCacheEntries = std::max(optDiagnostics->peakCacheEntries, cache.size());
+      const size_t residentStateEntries =
+          cache.size() + cacheSet.size() + residentNextUses.size() + seenKeys.size();
+      optDiagnostics->peakResidentStateEntries =
+          std::max(optDiagnostics->peakResidentStateEntries, residentStateEntries);
+      optDiagnostics->peakAuxiliarySlots =
+          std::max(optDiagnostics->peakAuxiliarySlots, nextUse.size() + residentStateEntries);
+    };
 
     for (int index = 0; index < static_cast<int>(trace.size()); ++index) {
       const int key = trace[static_cast<size_t>(index)];
-      std::vector<int>& offsets = futureAccesses[key];
-      if (!offsets.empty() && offsets.front() == index) {
-        offsets.erase(offsets.begin());
-      }
 
       if (cacheSet.find(key) != cacheSet.end()) {
+        residentNextUses[key] = nextUse[static_cast<size_t>(index)];
         recordHit(result, key);
         if (continuousPhases != nullptr) recordHit(phaseResult, key);
         if (Result* segment = segmentAt(static_cast<size_t>(index))) recordHit(*segment, key);
+        recordOptFootprint();
         finishAccess(static_cast<size_t>(index), cache);
         continue;
       }
@@ -341,15 +376,16 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy,
         int farthestUse = -1;
         for (size_t cacheIndex = 0; cacheIndex < cache.size(); ++cacheIndex) {
           const int cachedKey = cache[cacheIndex];
-          const auto& nextUses = futureAccesses[cachedKey];
-          const int nextUse = nextUses.empty() ? std::numeric_limits<int>::max() : nextUses.front();
-          if (nextUse > farthestUse) {
-            farthestUse = nextUse;
+          const int cachedNextUse = residentNextUses.at(cachedKey);
+          if (optDiagnostics != nullptr) optDiagnostics->victimCandidateScans += 1;
+          if (cachedNextUse > farthestUse) {
+            farthestUse = cachedNextUse;
             victimIndex = cacheIndex;
           }
         }
         const int evictedKey = cache[victimIndex];
         cacheSet.erase(evictedKey);
+        residentNextUses.erase(evictedKey);
         cache.erase(cache.begin() + static_cast<std::ptrdiff_t>(victimIndex));
         recordEviction(result, evictedKey);
         if (continuousPhases != nullptr) recordEviction(phaseResult, evictedKey);
@@ -358,6 +394,8 @@ Result runSimulation(const std::vector<int>& trace, int capacity, Policy policy,
 
       cache.push_back(key);
       cacheSet.insert(key);
+      residentNextUses[key] = nextUse[static_cast<size_t>(index)];
+      recordOptFootprint();
       finishAccess(static_cast<size_t>(index), cache);
     }
 
@@ -446,6 +484,67 @@ Result runReferenceOnlineSimulation(const std::vector<int>& trace, int capacity,
     if (static_cast<int>(cache.size()) >= capacity) {
       const int evictedKey = cache.front();
       cache.erase(cache.begin());
+      result.evictions += 1;
+      result.keyEvictions[evictedKey] += 1;
+    }
+    cache.push_back(key);
+  }
+
+  result.finalCache = cache;
+  return result;
+}
+
+Result runReferenceOptSimulation(const std::vector<int>& trace, int capacity, const KeyBytes& keyBytes = {}) {
+  Result result;
+  if (capacity <= 0) return result;
+
+  std::vector<int> cache;
+  std::unordered_set<int> seenKeys;
+  for (size_t accessIndex = 0; accessIndex < trace.size(); ++accessIndex) {
+    const int key = trace[accessIndex];
+    if (std::find(cache.begin(), cache.end(), key) != cache.end()) {
+      result.hits += 1;
+      result.keyHits[key] += 1;
+      continue;
+    }
+
+    result.misses += 1;
+    const long long bytes = bytesForKey(keyBytes, key);
+    result.missBytes += bytes;
+    result.keyMissBytes[key] += bytes;
+    if (seenKeys.insert(key).second) {
+      result.coldMisses += 1;
+      result.keyColdMisses[key] += 1;
+    } else {
+      result.reloadMisses += 1;
+      result.keyReloadMisses[key] += 1;
+    }
+
+    if (static_cast<int>(cache.size()) >= capacity) {
+      size_t victimIndex = 0;
+      size_t farthestUse = 0;
+      bool victimNeverReused = false;
+      for (size_t cacheIndex = 0; cacheIndex < cache.size(); ++cacheIndex) {
+        const int cachedKey = cache[cacheIndex];
+        const auto nextUse = std::find(trace.begin() + static_cast<std::ptrdiff_t>(accessIndex + 1),
+                                       trace.end(), cachedKey);
+        if (nextUse == trace.end()) {
+          if (!victimNeverReused) {
+            victimIndex = cacheIndex;
+            victimNeverReused = true;
+          }
+          continue;
+        }
+        if (victimNeverReused) continue;
+        const size_t nextUseIndex = static_cast<size_t>(std::distance(trace.begin(), nextUse));
+        if (nextUseIndex > farthestUse) {
+          farthestUse = nextUseIndex;
+          victimIndex = cacheIndex;
+        }
+      }
+
+      const int evictedKey = cache[victimIndex];
+      cache.erase(cache.begin() + static_cast<std::ptrdiff_t>(victimIndex));
       result.evictions += 1;
       result.keyEvictions[evictedKey] += 1;
     }
@@ -1271,21 +1370,34 @@ bool runSelfTest() {
               lruResult.finalCache == std::vector<int>({1, 2}),
           "LRU recency order must remain correct after an eviction shifts cache positions.");
 
+  const auto resultsMatch = [](const Result& production, const Result& reference) {
+    return production.hits == reference.hits && production.misses == reference.misses &&
+           production.coldMisses == reference.coldMisses &&
+           production.reloadMisses == reference.reloadMisses && production.evictions == reference.evictions &&
+           production.missBytes == reference.missBytes && production.finalCache == reference.finalCache &&
+           production.keyHits == reference.keyHits && production.keyColdMisses == reference.keyColdMisses &&
+           production.keyReloadMisses == reference.keyReloadMisses &&
+           production.keyEvictions == reference.keyEvictions &&
+           production.keyMissBytes == reference.keyMissBytes;
+  };
+
   int onlineParityChecks = 0;
   const auto requireOnlineParity = [&](const std::vector<int>& parityTrace, int capacity, Policy policy,
                                        const KeyBytes& parityBytes, const std::string& label) {
     const Result production = runSimulation(parityTrace, capacity, policy, 0, nullptr, parityBytes);
     const Result reference = runReferenceOnlineSimulation(parityTrace, capacity, policy, parityBytes);
-    require(production.hits == reference.hits && production.misses == reference.misses &&
-                production.coldMisses == reference.coldMisses &&
-                production.reloadMisses == reference.reloadMisses && production.evictions == reference.evictions &&
-                production.missBytes == reference.missBytes && production.finalCache == reference.finalCache &&
-                production.keyHits == reference.keyHits && production.keyColdMisses == reference.keyColdMisses &&
-                production.keyReloadMisses == reference.keyReloadMisses &&
-                production.keyEvictions == reference.keyEvictions &&
-                production.keyMissBytes == reference.keyMissBytes,
+    require(resultsMatch(production, reference),
             "Optimized " + label + " simulation diverged from the independent reference model.");
     onlineParityChecks += 1;
+  };
+  int optParityChecks = 0;
+  const auto requireOptParity = [&](const std::vector<int>& parityTrace, int capacity,
+                                    const KeyBytes& parityBytes, const std::string& label) {
+    const Result production = runSimulation(parityTrace, capacity, Policy::OPT, 0, nullptr, parityBytes);
+    const Result reference = runReferenceOptSimulation(parityTrace, capacity, parityBytes);
+    require(resultsMatch(production, reference),
+            "Optimized OPT simulation diverged from the independent scan-ahead reference for " + label + ".");
+    optParityChecks += 1;
   };
 
   std::vector<int> parityTrace;
@@ -1303,6 +1415,7 @@ bool runSelfTest() {
                         "FIFO capacity " + std::to_string(capacity));
     requireOnlineParity(parityTrace, capacity, Policy::LRU, parityBytes,
                         "LRU capacity " + std::to_string(capacity));
+    requireOptParity(parityTrace, capacity, parityBytes, "baseline capacity " + std::to_string(capacity));
   }
 
   for (unsigned int seed = 1; seed <= 64; ++seed) {
@@ -1349,10 +1462,13 @@ bool runSelfTest() {
       const std::string caseLabel = "seed " + std::to_string(seed) + ", capacity " + std::to_string(capacity);
       requireOnlineParity(generatedTrace, capacity, Policy::FIFO, generatedBytes, "FIFO " + caseLabel);
       requireOnlineParity(generatedTrace, capacity, Policy::LRU, generatedBytes, "LRU " + caseLabel);
+      requireOptParity(generatedTrace, capacity, generatedBytes, caseLabel);
     }
   }
   require(onlineParityChecks == 742,
           "The deterministic multi-seed parity corpus should exercise exactly 742 policy/capacity cases.");
+  require(optParityChecks == 371,
+          "The deterministic OPT parity corpus should exercise exactly 371 trace/capacity cases.");
 
   constexpr int largeCapacity = 10000;
   std::vector<int> largeRecencyTrace;
@@ -1368,6 +1484,36 @@ bool runSelfTest() {
               largeLruResult.finalCache.size() == static_cast<size_t>(largeCapacity) &&
               largeLruResult.finalCache.front() == 2 && largeLruResult.finalCache.back() == largeCapacity + 1,
           "Large-capacity LRU recency updates should preserve exact eviction order.");
+
+  constexpr int optBenchmarkAccesses = 65536;
+  constexpr int optBenchmarkUniqueKeys = 4096;
+  constexpr int optBenchmarkCapacity = 256;
+  std::vector<int> optBenchmarkTrace;
+  optBenchmarkTrace.reserve(optBenchmarkAccesses);
+  for (int index = 0; index < optBenchmarkAccesses; ++index) {
+    optBenchmarkTrace.push_back(1 + index % optBenchmarkUniqueKeys);
+  }
+  OptDiagnostics optDiagnostics;
+  const Result optBenchmarkResult =
+      runSimulation(optBenchmarkTrace, optBenchmarkCapacity, Policy::OPT, 0, nullptr, {}, 0, nullptr, nullptr,
+                    &optDiagnostics);
+  const size_t expectedResidentState =
+      static_cast<size_t>(optBenchmarkUniqueKeys + 3 * optBenchmarkCapacity);
+  const size_t expectedAuxiliarySlots = static_cast<size_t>(optBenchmarkAccesses) + expectedResidentState;
+  require(optBenchmarkResult.hits + optBenchmarkResult.misses == optBenchmarkAccesses &&
+              optBenchmarkResult.coldMisses == optBenchmarkUniqueKeys &&
+              optBenchmarkResult.reloadMisses == optBenchmarkResult.misses - optBenchmarkUniqueKeys &&
+              optBenchmarkResult.evictions == optBenchmarkResult.misses - optBenchmarkCapacity,
+          "The OPT memory benchmark should preserve access, miss-classification, and eviction invariants.");
+  require(optDiagnostics.nextUseSlots == static_cast<size_t>(optBenchmarkAccesses) &&
+              optDiagnostics.preprocessingKeys == static_cast<size_t>(optBenchmarkUniqueKeys) &&
+              optDiagnostics.peakCacheEntries == static_cast<size_t>(optBenchmarkCapacity) &&
+              optDiagnostics.peakResidentStateEntries == expectedResidentState &&
+              optDiagnostics.peakAuxiliarySlots == expectedAuxiliarySlots,
+          "OPT auxiliary state should stay within one next-use slot per access plus unique/resident key state.");
+  require(optDiagnostics.victimCandidateScans ==
+              static_cast<long long>(optBenchmarkResult.evictions) * optBenchmarkCapacity,
+          "OPT victim selection work should remain bounded by capacity scans on actual evictions.");
 
   const std::vector<int> anomalyTrace = {1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5};
   const Result fifoThree = runSimulation(anomalyTrace, 3, Policy::FIFO);
@@ -1449,10 +1595,12 @@ bool runSelfTest() {
               weightedComparison.steadyByteCounts.ties == 1,
           "Steady-state byte recommendations should cover one LRU, one FIFO, and one tie phase.");
 
-  std::cout << "Self-test passed: optimized online policies match the reference model across "
-            << onlineParityChecks
-            << " deterministic policy/capacity cases; large-cache recency, parsing, byte-weighted cost, and "
-               "phase-transition contracts are stable.\n";
+  std::cout << "Self-test passed: optimized online policies match " << onlineParityChecks
+            << " reference cases; OPT matches " << optParityChecks
+            << " independent scan-ahead cases and stays within " << optDiagnostics.peakAuxiliarySlots
+            << " logical auxiliary slots on the " << optBenchmarkAccesses
+            << "-access memory contract; large-cache recency, parsing, byte-weighted cost, and phase-transition "
+               "contracts are stable.\n";
   return true;
 }
 

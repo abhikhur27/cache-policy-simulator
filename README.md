@@ -88,8 +88,12 @@ Run the built-in regression checks:
 
 The self-test cross-checks the production FIFO/LRU engine against a deliberately simple linear reference across
 64 deterministic mixed-regime traces, varied capacities, and byte weights (742 policy/capacity cases total). It
-also exercises a 10,000-entry LRU working set so recency refreshes and eviction order stay correct at a size where
-vector-wide position rebuilds would be impractical.
+also cross-checks OPT against an independent scan-ahead implementation across 371 trace/capacity cases. A
+65,536-access, 4,096-key OPT contract caps algorithm-owned lookahead/cache state at 70,400 logical slots (result
+metrics and allocator overhead excluded) and verifies that victim-selection work is bounded to one capacity scan
+per eviction. Finally,
+the suite exercises a 10,000-entry LRU working set so recency refreshes and eviction order stay correct at a size
+where vector-wide position rebuilds would be impractical.
 
 Arguments:
 
@@ -100,7 +104,7 @@ Arguments:
 - `--key-bytes path`: Optional key-to-byte mapping used to calculate total and per-key refill volume. Every trace key must be mapped.
 - `--top-keys N`: Optional number of per-policy hot/churn keys to include in console, Markdown, and JSON diagnostics.
 - `--json-out path`: Optional machine-readable report with sweep and phase-local metrics.
-- `--self-test`: Runs deterministic parser/simulation regressions and cross-checks the optimized FIFO/LRU engine against an independent linear reference model across hundreds of generated policy/capacity cases.
+- `--self-test`: Runs deterministic parser/simulation regressions; cross-checks optimized FIFO/LRU and OPT engines against independent references across hundreds of generated policy/capacity cases; and enforces large-cache and OPT auxiliary-state budgets.
 
 ## Output
 
@@ -130,7 +134,9 @@ Arguments:
 FIFO and LRU keep eviction order in a linked list with hash-indexed entries. Cache hits, recency refreshes, and
 online evictions therefore use average constant-time bookkeeping instead of rebuilding a position map across the
 entire cache. The intentionally linear reference implementation remains test-only so it can catch mistakes in the
-optimized path without sharing its data structure.
+optimized path without sharing its data structure. OPT builds one reverse next-use table for the trace and stores
+only the next use for resident keys; it no longer erases from per-key future-access vectors on every request. Its
+test-only reference instead scans the remaining trace directly, keeping the parity check structurally independent.
 
 ## Example workload
 
